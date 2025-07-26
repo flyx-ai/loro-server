@@ -11,6 +11,8 @@ pub enum LoroServerInitError {
     CreateDocumentStatusKvFailed(async_nats::jetstream::context::CreateKeyValueError),
     #[error("create stream failed: {0}")]
     CreateStreamFailed(async_nats::jetstream::context::CreateStreamError),
+    #[error("get stream failed: {0}")]
+    GetStreamFailed(async_nats::jetstream::context::GetStreamError),
 }
 
 pub struct LoroServerState {
@@ -117,31 +119,32 @@ pub async fn init_loro_server(
         .await
         .map_err(LoroServerInitError::CreateDocumentStatusKvFailed)?,
     );
+    js.create_or_update_stream(async_nats::jetstream::stream::Config {
+        name: "loro-wal".to_string(),
+        description: Some(
+            "Stream for storing the WAL (Write Ahead Log) messages for all Lorogo documents."
+                .to_string(),
+        ),
+        subjects: vec!["loro.wal.>".to_string()],
+        discard: async_nats::jetstream::stream::DiscardPolicy::New,
+        ..Default::default()
+    })
+    .await
+    .map_err(LoroServerInitError::CreateStreamFailed)?;
     let wal_stream = std::sync::Arc::new(
-        js.create_or_update_stream(async_nats::jetstream::stream::Config {
-            name: "loro-wal".to_string(),
-            description: Some(
-                "Stream for storing the WAL (Write Ahead Log) messages for all Lorogo documents."
-                    .to_string(),
-            ),
-            subjects: vec!["loro.wal.>".to_string()],
-            discard: async_nats::jetstream::stream::DiscardPolicy::New,
-            ..Default::default()
-        })
-        .await
-        .map_err(LoroServerInitError::CreateStreamFailed)?,
+        js.get_stream("loro-wal")
+            .await
+            .map_err(LoroServerInitError::GetStreamFailed)?,
     );
-    let _ = std::sync::Arc::new(
-        js.create_or_update_stream(async_nats::jetstream::stream::Config {
-            name: "loro-json-update".to_string(),
-            description: Some("Stream for storing JSON updates for Loro documents.".to_string()),
-            subjects: vec!["loro.json_update.>".to_string()],
-            retention: async_nats::jetstream::stream::RetentionPolicy::WorkQueue,
-            ..Default::default()
-        })
-        .await
-        .map_err(LoroServerInitError::CreateStreamFailed)?,
-    );
+    js.create_or_update_stream(async_nats::jetstream::stream::Config {
+        name: "loro-json-update".to_string(),
+        description: Some("Stream for storing JSON updates for Loro documents.".to_string()),
+        subjects: vec!["loro.json_update.>".to_string()],
+        retention: async_nats::jetstream::stream::RetentionPolicy::WorkQueue,
+        ..Default::default()
+    })
+    .await
+    .map_err(LoroServerInitError::CreateStreamFailed)?;
 
     let mut document_check_interval = tokio::time::interval(std::time::Duration::from_secs(3));
 

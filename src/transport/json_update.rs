@@ -1,4 +1,4 @@
-use std::{any::Any, hash::Hasher};
+use std::hash::Hasher;
 
 const CHUNK_SIZE: usize = 128 * 1024; // 128 KiB
 
