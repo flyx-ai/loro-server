@@ -11,6 +11,6 @@
     "typescript": "^5"
   },
   "dependencies": {
-    "loro-crdt": "^1.5.4"
+    "loro-crdt": "^1.5.9"
   }
 }

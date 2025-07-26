@@ -5,6 +5,8 @@ use thiserror::Error;
 pub enum InitDocError {
     #[error("failed to send ping request")]
     PingRequestFailed(crate::transport::MakeRequestError),
+    #[error("ping request returned non-200 status code")]
+    PingRequestInvalidStatusCode(),
     #[error("failed to get document entry")]
     DocumentEntryError(async_nats::jetstream::kv::EntryError),
     #[error("failed to create document status")]
@@ -65,6 +67,11 @@ pub async fn ping_and_init_doc(
                                 .await;
                                 match resp {
                                     Ok(v) => {
+                                        if v.status_code != 200 {
+                                            return Err(
+                                                InitDocError::PingRequestInvalidStatusCode(),
+                                            );
+                                        }
                                         if String::from_utf8_lossy(&v.payload) == "pong" {
                                             return Ok(());
                                         }

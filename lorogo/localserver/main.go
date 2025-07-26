@@ -5,6 +5,7 @@ import (
 	"log/slog"
 	"net/http"
 
+	"github.com/flyx-ai/loro-server/lorogo/transport"
 	"github.com/flyx-ai/loro-server/lorogo/web"
 	"github.com/nats-io/nats.go"
 	"github.com/nats-io/nats.go/jetstream"
@@ -26,6 +27,24 @@ func main() {
 	if err != nil {
 		panic(err)
 	}
+	jsonUpdateStream, err := js.CreateOrUpdateStream(context.Background(), jetstream.StreamConfig{
+		Name:        "loro-json-update",
+		Description: "Stream for storing JSON updates for Loro documents.",
+		Subjects:    []string{"loro.json_update.>"},
+		Retention:   jetstream.WorkQueuePolicy,
+	})
+	if err != nil {
+		panic(err)
+	}
+	jsonUpdateChan, err := transport.SubscribeJSONUpdate(context.Background(), jsonUpdateStream)
+	if err != nil {
+		panic(err)
+	}
+	go func() {
+		for update := range jsonUpdateChan {
+			slog.Info("Received JSON update", "documentID", update.DocumentID, "updateOps", update.UpdateOps)
+		}
+	}()
 
 	mux := http.NewServeMux()
 	mux.HandleFunc("/api/v1/document/{documentID}/ws", func(w http.ResponseWriter, r *http.Request) {
@@ -38,7 +57,6 @@ func main() {
 		err := web.TableListenHandler(r.Context(), nc, js, documentStatusKV, documentID, w, r)
 		if err != nil {
 			slog.Error("Failed to handle WebSocket connection", "documentID", documentID, "error", err)
-			http.Error(w, err.Error(), http.StatusInternalServerError)
 			return
 		}
 	})
@@ -58,6 +76,7 @@ func main() {
 			}
 		}
 	})
+
 	slog.Info("Starting Loro Server", "port", "8080")
 	err = http.ListenAndServe("0.0.0.0:8080", mux)
 	if err != nil {

@@ -9,13 +9,13 @@ pub enum LoroServerInitError {
     NatsServiceEndpointStartFailed(NatsGenericError),
     #[error("create document status kv failed: {0}")]
     CreateDocumentStatusKvFailed(async_nats::jetstream::context::CreateKeyValueError),
-    #[error("create wal stream failed: {0}")]
-    CreateWalStreamFailed(async_nats::jetstream::context::CreateStreamError),
+    #[error("create stream failed: {0}")]
+    CreateStreamFailed(async_nats::jetstream::context::CreateStreamError),
 }
 
 pub struct LoroServerState {
     pub document: std::sync::Arc<loro::LoroDoc>,
-    pub last_seq: u64,
+    pub last_seq: i64,
     pub initialized: bool,
     operation_id: String,
 }
@@ -50,15 +50,25 @@ impl LoroServerStates {
         &self,
         id: String,
         operation_id: String,
+        document_seq_kv: std::sync::Arc<async_nats::jetstream::kv::Store>,
     ) -> std::sync::Arc<tokio::sync::RwLock<LoroServerState>> {
         let mut states = self.states.write().await;
+        let document_seq = document_seq_kv.get(id.clone()).await;
+        let mut last_seq = -1;
+        if let Ok(Some(seq_entry)) = document_seq {
+            if seq_entry.len() == 8 {
+                last_seq =
+                    i64::from_le_bytes((*seq_entry).try_into().expect("seq is 8 bytes long"));
+            }
+        }
         if let Some(state) = states.get(&id) {
             state.write().await.operation_id = operation_id.clone();
+            state.write().await.last_seq = last_seq;
             state.clone()
         } else {
             let new_state = std::sync::Arc::new(tokio::sync::RwLock::new(LoroServerState {
                 document: std::sync::Arc::new(loro::LoroDoc::new()),
-                last_seq: 0,
+                last_seq,
                 operation_id: operation_id.clone(),
                 initialized: false,
             }));
@@ -83,14 +93,14 @@ pub async fn init_loro_server(
     js: std::sync::Arc<async_nats::jetstream::Context>,
     service: &async_nats::service::Service,
 ) -> Result<(), LoroServerInitError> {
-    tracing::debug!("initializaing loro server");
+    tracing::info!("initializaing loro server");
 
     let loro_server_id = nanoid::nanoid!();
-    tracing::debug!("loro server id: {}", loro_server_id);
+    tracing::info!("loro server id: {}", loro_server_id);
     let loro_server_states = std::sync::Arc::new(LoroServerStates::new());
     let loro_service_group = service.group("loro");
     let document_status_kv = std::sync::Arc::new(
-        js.create_key_value(async_nats::jetstream::kv::Config {
+        js.create_or_update_key_value(async_nats::jetstream::kv::Config {
             bucket: "loro-document-status".to_string(),
             description: "Loro Document Status".to_string(),
             ..Default::default()
@@ -98,8 +108,17 @@ pub async fn init_loro_server(
         .await
         .map_err(LoroServerInitError::CreateDocumentStatusKvFailed)?,
     );
+    let document_seq_kv = std::sync::Arc::new(
+        js.create_or_update_key_value(async_nats::jetstream::kv::Config {
+            bucket: "loro-document-seq".to_string(),
+            description: "Loro Document Sequence".to_string(),
+            ..Default::default()
+        })
+        .await
+        .map_err(LoroServerInitError::CreateDocumentStatusKvFailed)?,
+    );
     let wal_stream = std::sync::Arc::new(
-        js.create_stream(async_nats::jetstream::stream::Config {
+        js.create_or_update_stream(async_nats::jetstream::stream::Config {
             name: "loro-wal".to_string(),
             description: Some(
                 "Stream for storing the WAL (Write Ahead Log) messages for all Lorogo documents."
@@ -107,12 +126,21 @@ pub async fn init_loro_server(
             ),
             subjects: vec!["loro.wal.>".to_string()],
             discard: async_nats::jetstream::stream::DiscardPolicy::New,
-            storage: async_nats::jetstream::stream::StorageType::File,
-            num_replicas: 1,
             ..Default::default()
         })
         .await
-        .map_err(LoroServerInitError::CreateWalStreamFailed)?,
+        .map_err(LoroServerInitError::CreateStreamFailed)?,
+    );
+    let _ = std::sync::Arc::new(
+        js.create_or_update_stream(async_nats::jetstream::stream::Config {
+            name: "loro-json-update".to_string(),
+            description: Some("Stream for storing JSON updates for Loro documents.".to_string()),
+            subjects: vec!["loro.json_update.>".to_string()],
+            retention: async_nats::jetstream::stream::RetentionPolicy::WorkQueue,
+            ..Default::default()
+        })
+        .await
+        .map_err(LoroServerInitError::CreateStreamFailed)?,
     );
 
     let mut document_check_interval = tokio::time::interval(std::time::Duration::from_secs(3));
@@ -140,16 +168,20 @@ pub async fn init_loro_server(
                 Some(msg) = init_endpoint.next() => {
                     tracing::debug!("init endpoint received message");
                     let nc = nc.clone();
+                    let js = js.clone();
                     let loro_server_id = loro_server_id.clone();
                     let loro_server_states = loro_server_states.clone();
                     let document_status_kv = document_status_kv.clone();
+                    let document_seq_kv = document_seq_kv.clone();
                     let wal_stream = wal_stream.clone();
                     tokio::spawn(async move {
                         handle_init(
                             nc,
+                            js,
                             loro_server_id,
                             loro_server_states,
                             document_status_kv,
+                            document_seq_kv,
                             wal_stream,
                             &msg,
                         )
@@ -360,9 +392,11 @@ pub enum LoroServerInitServiceError {
 
 async fn handle_init(
     nc: std::sync::Arc<async_nats::Client>,
+    js: std::sync::Arc<async_nats::jetstream::Context>,
     loro_server_id: String,
     loro_server_states: std::sync::Arc<LoroServerStates>,
     document_status_kv: std::sync::Arc<async_nats::jetstream::kv::Store>,
+    document_seq_kv: std::sync::Arc<async_nats::jetstream::kv::Store>,
     wal_stream: std::sync::Arc<async_nats::jetstream::stream::Stream>,
     req: &async_nats::service::Request,
 ) -> Result<(), LoroServerInitServiceError> {
@@ -370,18 +404,24 @@ async fn handle_init(
     let document_id = subject.strip_prefix("loro.init.").ok_or(
         LoroServerInitServiceError::DecodeTableIDError(subject.to_string()),
     )?;
-    tracing::debug!("handling init for document {}", document_id);
+    tracing::info!("handling init for document {}", document_id);
     let document_id = document_id.to_string();
     let operation_id = String::from_utf8_lossy(req.message.payload.as_ref());
     let loro_server_state = loro_server_states
-        .get_or_create(document_id.clone(), operation_id.to_string())
+        .get_or_create(
+            document_id.clone(),
+            operation_id.to_string(),
+            document_seq_kv.clone(),
+        )
         .await;
     super::wal::init_loro_document(
         document_id.clone(),
         nc.clone(),
+        js.clone(),
         wal_stream.clone(),
         loro_server_state,
         loro_server_states.clone(),
+        document_seq_kv.clone(),
     )
     .await?;
     tracing::debug!(

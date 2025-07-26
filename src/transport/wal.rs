@@ -1,5 +1,5 @@
+use bytes::Bytes;
 use futures::{FutureExt, StreamExt};
-use loro::ToJson;
 use std::hash::Hasher;
 use thiserror::Error;
 
@@ -19,6 +19,8 @@ pub enum LoroInitDocumentError {
     LoroImportError(loro::LoroError),
     #[error("failed to acknowledge WAL message: {0}")]
     AckMessageError(NatsGenericError),
+    #[error("failed to get message info: {0}")]
+    GetMessageInfoError(NatsGenericError),
 }
 
 struct ChunkStoreEntry {
@@ -29,16 +31,68 @@ struct ChunkStoreEntry {
     response_inbox: String,
     chunk_count: usize,
     digest: u64,
+    new_message: bool,
+}
+
+fn save_last_seq(
+    id: String,
+    document_seq_kv: std::sync::Arc<async_nats::jetstream::kv::Store>,
+    last_seq: i64,
+) -> () {
+    tokio::spawn(async move {
+        let last_seq_val_temp = i64::to_le_bytes(last_seq);
+
+        loop {
+            let old_seq = document_seq_kv.entry(id.clone()).await;
+            match old_seq {
+                Ok(Some(v)) => {
+                    let mut v_val = 0;
+                    if v.value.len() == 8 {
+                        v_val = i64::from_le_bytes(
+                            (*v.value).try_into().expect("entry should be 8 bytes"),
+                        );
+                    }
+                    if v_val < last_seq {
+                        let last_seq_val = Bytes::copy_from_slice(&last_seq_val_temp);
+                        let res = document_seq_kv
+                            .update(id.clone(), last_seq_val, v.revision)
+                            .await;
+                        if res.is_err() {
+                            continue;
+                        }
+                    }
+                }
+                Ok(None) => {
+                    let last_seq_val = Bytes::copy_from_slice(&last_seq_val_temp);
+                    let res = document_seq_kv.create(id.clone(), last_seq_val).await;
+                    if res.is_err() {
+                        tracing::error!("Failed to create last_seq entry: {:?}", res);
+                        continue;
+                    }
+                }
+                Err(e) => {
+                    tracing::error!("Failed to get last_seq: {:?}", e);
+                    return;
+                }
+            };
+        }
+    });
 }
 
 pub async fn init_loro_document(
     document_id: String,
     nc: std::sync::Arc<async_nats::Client>,
+    js: std::sync::Arc<async_nats::jetstream::Context>,
     wal_stream: std::sync::Arc<async_nats::jetstream::stream::Stream>,
     server_state: std::sync::Arc<tokio::sync::RwLock<super::initialize::LoroServerState>>,
     server_states: std::sync::Arc<super::initialize::LoroServerStates>,
+    document_seq_kv: std::sync::Arc<async_nats::jetstream::kv::Store>,
 ) -> Result<(), LoroInitDocumentError> {
-    tracing::debug!("initializing loro document: {}", document_id);
+    tracing::info!(
+        "initializing loro document {} with last_seq: {}",
+        document_id,
+        server_state.read().await.last_seq
+    );
 
     let loro_doc = &server_state.read().await.document.clone();
 
@@ -56,41 +110,56 @@ pub async fn init_loro_document(
     );
 
     let mut chunk_store = std::collections::HashMap::<String, ChunkStoreEntry>::new();
+    let mut old_message_queue = Vec::<Vec<u8>>::new();
     let mut message_queue = Vec::<Vec<u8>>::new();
 
-    let mut messages = consumer
-        .fetch()
-        .max_messages(usize::MAX) // the entire document needs to fit in memory, so this is fine
-        .messages()
-        .await
-        .map_err(LoroInitDocumentError::GetBatchMessagesError)?;
+    loop {
+        let mut processed_messages = 0;
+        let mut messages = consumer
+            .fetch()
+            .messages()
+            .await
+            .map_err(LoroInitDocumentError::GetBatchMessagesError)?;
+        while let Some(Ok(message)) = messages.next().await {
+            processed_messages += 1;
+            if let Err(e) = process_message_wrapper(
+                nc.clone(),
+                &mut chunk_store,
+                &mut old_message_queue,
+                &mut message_queue,
+                &message,
+                server_state.read().await.last_seq,
+            )
+            .await
+            {
+                tracing::error!("Failed to process message: {:?}", e);
+            }
 
-    while let Some(Ok(message)) = messages.next().await {
-        if let Err(e) =
-            process_message_wrapper(nc.clone(), &mut chunk_store, &mut message_queue, &message)
-                .await
-        {
-            tracing::error!("Failed to process message: {:?}", e);
+            let message_info = message
+                .info()
+                .map_err(LoroInitDocumentError::GetMessageInfoError)?;
+            let seq = message_info.stream_sequence as i64;
+            let mut state = server_state.write().await;
+            if state.last_seq < seq {
+                state.last_seq = seq;
+                save_last_seq(document_id.clone(), document_seq_kv.clone(), seq);
+            }
         }
-        let seq = get_jetstream_msg_metadata(&message).sequence.stream;
-        let mut state = server_state.write().await;
-        if state.last_seq < seq {
-            state.last_seq = seq;
+        if processed_messages == 0 {
+            break;
         }
     }
 
-    tracing::debug!("running import_batch on {} messages", message_queue.len());
-
-    loro_doc
-        .import_batch(message_queue.as_slice())
-        .map_err(LoroInitDocumentError::LoroImportError)?;
-
     tracing::info!(
-        "state of loro_doc after import_batch: {}",
-        loro_doc.get_deep_value().to_json_value()
+        "running initial import_batch on {} messages",
+        old_message_queue.len()
     );
 
-    message_queue.clear();
+    loro_doc
+        .import_batch(old_message_queue.as_slice())
+        .map_err(LoroInitDocumentError::LoroImportError)?;
+
+    old_message_queue.clear();
 
     {
         let document_id = document_id.clone();
@@ -112,12 +181,15 @@ pub async fn init_loro_document(
         tokio::spawn(async move {
             if let Err(e) = process_messages(
                 nc,
+                js,
                 document_id,
                 server_state,
                 consumer,
                 chunk_store,
+                old_message_queue,
                 message_queue,
                 server_states,
+                document_seq_kv,
             )
             .await
             {
@@ -137,14 +209,17 @@ pub async fn init_loro_document(
 
 async fn process_messages(
     nc: std::sync::Arc<async_nats::Client>,
+    js: std::sync::Arc<async_nats::jetstream::Context>,
     document_id: String,
     server_state: std::sync::Arc<tokio::sync::RwLock<super::initialize::LoroServerState>>,
     consumer: std::sync::Arc<
         async_nats::jetstream::consumer::Consumer<async_nats::jetstream::consumer::pull::Config>,
     >,
     chunk_store: std::collections::HashMap<String, ChunkStoreEntry>,
+    old_message_queue: Vec<Vec<u8>>,
     message_queue: Vec<Vec<u8>>,
     server_states: std::sync::Arc<super::initialize::LoroServerStates>,
+    document_seq_kv: std::sync::Arc<async_nats::jetstream::kv::Store>,
 ) -> Result<(), LoroInitDocumentError> {
     tracing::debug!("processing messages for document: {}", document_id);
     let loro_doc = &server_state.read().await.document.clone();
@@ -154,6 +229,7 @@ async fn process_messages(
         .map_err(LoroInitDocumentError::GetMessagesError)?;
 
     let mut chunk_store = chunk_store;
+    let mut old_message_queue = old_message_queue;
     let mut message_queue = message_queue;
 
     loop {
@@ -175,15 +251,31 @@ async fn process_messages(
             } else {
                 tracing::debug!("running import_batch on {} messages", message_queue.len());
 
+                let old_vv = loro_doc.oplog_vv();
                 loro_doc
                     .import_batch(message_queue.as_slice())
                     .map_err(LoroInitDocumentError::LoroImportError)?;
+                let new_nc = nc.clone();
+                let new_js = js.clone();
+                let new_vv = loro_doc.oplog_vv();
+                let new_loro_doc = loro_doc.clone();
+                let new_document_id = document_id.clone();
+                tokio::spawn(async move {
+                    let json_update = new_loro_doc.export_json_updates(&old_vv, &new_vv);
+                    let document_id = new_document_id;
+                    let res = super::json_update::export_json_update(
+                        new_nc,
+                        new_js,
+                        document_id,
+                        new_loro_doc,
+                        &json_update,
+                    )
+                    .await;
+                    if let Err(e) = res {
+                        tracing::error!("Failed to export JSON update: {:?}", e);
+                    }
+                });
                 message_queue.clear();
-
-                tracing::info!(
-                    "state of loro_doc after import_batch: {}",
-                    loro_doc.get_deep_value().to_json_value()
-                );
 
                 continue;
             }
@@ -192,16 +284,32 @@ async fn process_messages(
         }
 
         if let Some(Ok(msg)) = msg {
-            if let Err(e) =
-                process_message_wrapper(nc.clone(), &mut chunk_store, &mut message_queue, &msg)
-                    .await
+            if let Err(e) = process_message_wrapper(
+                nc.clone(),
+                &mut chunk_store,
+                &mut old_message_queue,
+                &mut message_queue,
+                &msg,
+                server_state.read().await.last_seq,
+            )
+            .await
             {
                 tracing::error!("Failed to process message: {:?}", e);
             }
-            let seq = get_jetstream_msg_metadata(&msg).sequence.stream;
+            if !old_message_queue.is_empty() {
+                tracing::error!(
+                    "old_message_queue is not empty after processing new message: {}",
+                    old_message_queue.len()
+                );
+            }
+            let message_info = msg
+                .info()
+                .map_err(LoroInitDocumentError::GetMessageInfoError)?;
+            let seq = message_info.stream_sequence as i64;
             let mut state = server_state.write().await;
             if state.last_seq < seq {
                 state.last_seq = seq;
+                save_last_seq(document_id.clone(), document_seq_kv.clone(), seq);
             }
         }
     }
@@ -212,20 +320,30 @@ async fn process_messages(
 async fn process_message_wrapper(
     nc: std::sync::Arc<async_nats::Client>,
     chunk_store: &mut std::collections::HashMap<String, ChunkStoreEntry>,
+    old_message_queue: &mut Vec<Vec<u8>>,
     message_queue: &mut Vec<Vec<u8>>,
     message: &async_nats::jetstream::Message,
+    last_seq: i64,
 ) -> Result<(), LoroInitDocumentError> {
-    let message_timestamp: chrono::DateTime<chrono::Utc> =
-        get_jetstream_msg_metadata(&message).timestamp;
-    let do_send_response = chrono::Utc::now() - message_timestamp <= chrono::Duration::seconds(600);
-    let res = process_message(chunk_store, message_queue, &message);
+    let message_info = message
+        .info()
+        .map_err(LoroInitDocumentError::GetMessageInfoError)?;
+    let message_seq = message_info.stream_sequence as i64;
+    let is_new_message = message_seq > last_seq;
+    let res = process_message(
+        chunk_store,
+        old_message_queue,
+        message_queue,
+        &message,
+        is_new_message,
+    );
     match res {
         Ok(v) => {
             message
                 .ack_with(async_nats::jetstream::AckKind::Ack)
                 .await
                 .map_err(LoroInitDocumentError::AckMessageError)?;
-            if do_send_response {
+            if is_new_message {
                 if let Some(response_inbox) = v {
                     let nc = nc.clone();
                     tokio::spawn(async move {
@@ -243,7 +361,7 @@ async fn process_message_wrapper(
                 .ack_with(async_nats::jetstream::AckKind::Term)
                 .await
                 .map_err(LoroInitDocumentError::AckMessageError)?;
-            if do_send_response {
+            if is_new_message {
                 if let Some(response_inbox) = e.response_inbox {
                     let nc = nc.clone();
                     let msg = e.message.clone();
@@ -290,8 +408,10 @@ impl std::fmt::Display for MalformedMessageError {
 
 fn process_message(
     chunk_store: &mut std::collections::HashMap<String, ChunkStoreEntry>,
+    old_message_queue: &mut Vec<Vec<u8>>,
     message_queue: &mut Vec<Vec<u8>>,
     message: &async_nats::jetstream::Message,
+    is_new_message: bool,
 ) -> Result<Option<String>, MalformedMessageError> {
     let header = match message.headers {
         Some(ref header) => header,
@@ -320,12 +440,16 @@ fn process_message(
                 response_inbox: String::new(),
                 chunk_count: 0,
                 digest: 0,
+                new_message: is_new_message,
             },
         );
     }
     let chunk_store_entry = chunk_store
         .get_mut(log_id)
         .expect("Chunk store entry not found when it should be");
+    if is_new_message && !chunk_store_entry.new_message {
+        chunk_store_entry.new_message = true;
+    }
     let chunk_index = header
         .get("LORO_CHUNK_INDEX")
         .ok_or(MalformedMessageError {
@@ -404,8 +528,13 @@ fn process_message(
             .iter()
             .map(|(_, v)| v.len())
             .sum::<usize>();
-        message_queue.push(Vec::with_capacity(buffer_size));
-        let buffer = message_queue.last_mut().unwrap();
+        let queue = if chunk_store_entry.new_message {
+            message_queue
+        } else {
+            old_message_queue
+        };
+        queue.push(Vec::with_capacity(buffer_size));
+        let buffer = queue.last_mut().unwrap();
         for i in 0..chunk_store_entry.chunk_count {
             let chunk = chunk_store_entry
                 .chunks
@@ -420,102 +549,4 @@ fn process_message(
     }
 
     Ok(None)
-}
-
-// SequencePair includes the consumer and stream sequence numbers for a
-// message.
-struct SequencePair {
-    // Consumer is the consumer sequence number for message deliveries. This
-    // is the total number of messages the consumer has seen (including
-    // redeliveries).
-    // consumer: u64,
-
-    // Stream is the stream sequence number for a message.
-    stream: u64,
-}
-
-struct JetstreamMsgMetadata {
-    // Sequence is the sequence information for the message.
-    sequence: SequencePair,
-
-    // NumDelivered is the number of times this message was delivered to the
-    // consumer.
-    // num_delivered: u64,
-
-    // NumPending is the number of messages that match the consumer's
-    // filter, but have not been delivered yet.
-    // num_pending: u64,
-
-    // Timestamp is the time the message was originally stored on a stream.
-    timestamp: chrono::DateTime<chrono::Utc>,
-    // Stream is the stream name this message is stored on.
-    // stream: String,
-
-    // Consumer is the consumer name this message was delivered to.
-    // consumer: String,
-
-    // Domain is the domain this message was received on.
-    // domain: String,
-}
-
-fn get_jetstream_msg_metadata(msg: &async_nats::jetstream::Message) -> JetstreamMsgMetadata {
-    let tokens = msg.reply.as_ref().unwrap();
-    let tokens = get_jetstream_tokens_from_string(tokens);
-
-    // let domain = tokens[2].to_string();
-    // let account_hash = tokens[3].to_string();
-    // let stream = tokens[4].to_string();
-    // let consumer = tokens[5].to_string();
-    // let delivered = tokens[6].to_string();
-    // let sseq = tokens[7].to_string();
-    let cseq = tokens[8].to_string();
-    let tm = tokens[9].to_string();
-    // let pending = tokens[10].to_string();
-
-    JetstreamMsgMetadata {
-        // domain: if domain == "_" {
-        //     "".to_string()
-        // } else {
-        //     domain
-        // },
-        // num_delivered: delivered.parse::<u64>().unwrap_or(0),
-        // num_pending: pending.parse::<u64>().unwrap_or(0),
-        timestamp: chrono::DateTime::<chrono::Utc>::from_timestamp_nanos(
-            tm.parse::<i64>().unwrap_or(0),
-        ),
-        // stream,
-        // consumer,
-        sequence: SequencePair {
-            // consumer: sseq.parse::<u64>().unwrap_or(0),
-            stream: cseq.parse::<u64>().unwrap_or(0),
-        },
-    }
-}
-
-fn get_jetstream_tokens_from_string(s: &str) -> Vec<&str> {
-    let mut tokens = s.split('.').collect::<Vec<_>>();
-
-    // Newer server will include the domain name and account hash in the subject,
-    // and a token at the end.
-    //
-    // Old subject was:
-    // $JS.ACK.<stream>.<consumer>.<delivered>.<sseq>.<cseq>.<tm>.<pending>
-    //
-    // New subject would be:
-    // $JS.ACK.<domain>.<account hash>.<stream>.<consumer>.<delivered>.<sseq>.<cseq>.<tm>.<pending>.<a token with a random value>
-    //
-    // v1 has 9 tokens, v2 has 12, but we must not be strict on the 12th since
-    // it may be removed in the future. Also, the library has no use for it.
-    // The point is that a v2 ACK subject is valid if it has at least 11 tokens.
-
-    let tokens_len = tokens.len();
-    // For v1 style, we insert 2 empty tokens (domain and hash) so that the
-    // rest of the library references known fields at a constant location.
-    if tokens_len == 9 {
-        tokens.insert(2, "");
-        tokens.insert(2, "");
-    } else if tokens[2] == "_" {
-        tokens[2] = ""
-    }
-    return tokens;
 }

@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"log/slog"
 	"net/http"
 	"sync"
@@ -380,7 +381,9 @@ func TableListenHandler(
 			return innerErr
 		case err := <-errCh:
 			var closeErr websocket.CloseError
-			if errors.As(err, &closeErr) {
+			if errors.Is(err, io.EOF) {
+				return nil
+			} else if errors.As(err, &closeErr) {
 				attrs := []any{}
 				attrs = append(attrs, "code", closeErr.Code.String())
 				if closeErr.Reason != "" {

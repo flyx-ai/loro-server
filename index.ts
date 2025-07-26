@@ -11,8 +11,11 @@ const doc = new CRDTDoc(
 
 const a = doc.doc.getList("a");
 a.insert(0, "A");
+a.insert(1, "hi");
+const b = doc.doc.getMap("b");
+b.set("key1", "value1");
+b.set("key2", "value2");
 doc.doc.commit();
-console.log(doc.doc.toJSON());
 setTimeout(() => {
   console.log(doc.doc.toJSON());
-}, 2000);
+}, 1000);

@@ -25,7 +25,7 @@ pub async fn init_webserver(
     js: std::sync::Arc<async_nats::jetstream::Context>,
 ) {
     let document_status_kv = std::sync::Arc::new(
-        js.create_key_value(async_nats::jetstream::kv::Config {
+        js.create_or_update_key_value(async_nats::jetstream::kv::Config {
             bucket: "loro-document-status".to_string(),
             description: "Loro Document Status".to_string(),
             ..Default::default()

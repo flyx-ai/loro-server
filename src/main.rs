@@ -26,6 +26,7 @@ pub enum LoroServerError {
 async fn main() -> Result<(), LoroServerError> {
     tracing_subscriber::fmt()
         .with_max_level(tracing::Level::INFO)
+        .with_env_filter(tracing_subscriber::EnvFilter::new("info,loro_internal=warn"))
         .init();
 
     let nats_url = env::var("NATS_URL").unwrap_or_else(|_| "nats://127.0.0.1:4222".to_string());

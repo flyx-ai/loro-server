@@ -1,6 +1,7 @@
 mod core_transport;
 mod document_endpoints;
 mod initialize;
+mod json_update;
 mod wal;
 
 pub use core_transport::MakeRequestError;
