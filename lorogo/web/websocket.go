@@ -382,8 +382,12 @@ func TableListenHandler(
 		case err := <-errCh:
 			var closeErr websocket.CloseError
 			if errors.Is(err, io.EOF) {
-				return nil
+				return innerErr
 			} else if errors.As(err, &closeErr) {
+				if closeErr.Code == websocket.StatusNormalClosure {
+					return innerErr
+				}
+
 				attrs := []any{}
 				attrs = append(attrs, "code", closeErr.Code.String())
 				if closeErr.Reason != "" {

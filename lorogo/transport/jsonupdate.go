@@ -55,7 +55,12 @@ type JSONUpdate struct {
 	UpdateOps  []JSONUpdateOp `json:"update_ops"`
 }
 
-func processJSONUpdateMessage(ctx context.Context, msg jetstream.Msg, jsonUpdateStream jetstream.Stream) (JSONUpdate, error) {
+func processJSONUpdateMessage(
+	ctx context.Context,
+	js jetstream.JetStream,
+	msg jetstream.Msg,
+	jsonUpdateStream jetstream.Stream,
+) (JSONUpdate, error) {
 	messageHeaders := msg.Headers()
 	documentID := messageHeaders.Get("X-Document-ID")
 	chunkCountStr := messageHeaders.Get("X-Chunk-Count")
@@ -75,43 +80,59 @@ func processJSONUpdateMessage(ctx context.Context, msg jetstream.Msg, jsonUpdate
 
 	hasher := xxhash.New()
 
-	restConsumer, err := jsonUpdateStream.CreateConsumer(ctx, jetstream.ConsumerConfig{
-		Description:   "JSON Update Stream Rest Consumer",
-		FilterSubject: fmt.Sprintf("loro.json_update.rest.%s", jsonUpdateID),
-	})
-	if err != nil {
-		return JSONUpdate{}, fmt.Errorf("failed to create JSON update rest consumer: %w", err)
-	}
-
-	messages, err := restConsumer.Messages()
-	if err != nil {
-		return JSONUpdate{}, fmt.Errorf("failed to get messages from JSON update rest consumer: %w", err)
-	}
-	defer messages.Stop()
-
 	messagesSlice := make([]jetstream.Msg, chunkCount)
 	messagesSlice[0] = msg
-
 	messageLen := len(msg.Data())
-	for range chunkCount - 1 {
-		msg, err := messages.Next()
+
+	if chunkCount > 1 {
+		err := func() error {
+			restConsumerName := "json_update_rest_consumer_" + jsonUpdateID
+			restConsumer, err := jsonUpdateStream.CreateConsumer(ctx, jetstream.ConsumerConfig{
+				Name:          restConsumerName,
+				Description:   "JSON Update Stream Rest Consumer",
+				FilterSubject: fmt.Sprintf("loro.json_update.rest.%s", jsonUpdateID),
+			})
+			if err != nil {
+				return fmt.Errorf("failed to create JSON update rest consumer: %w", err)
+			}
+
+			messages, err := restConsumer.Messages()
+			if err != nil {
+				return fmt.Errorf("failed to get messages from JSON update rest consumer: %w", err)
+			}
+			defer func() {
+				messages.Stop()
+				err := js.DeleteConsumer(ctx, "loro-json-update", restConsumerName)
+				if err != nil {
+					slog.Error("Failed to delete JSON update rest consumer", "consumerName", restConsumerName, "error", err)
+				}
+			}()
+
+			for range chunkCount - 1 {
+				msg, err := messages.Next()
+				if err != nil {
+					return fmt.Errorf("error receiving JSON update message chunk: %w", err)
+				}
+
+				chunkIdxStr := msg.Headers().Get("X-Chunk-Index")
+				chunkIdx, err := strconv.ParseInt(chunkIdxStr, 10, 32)
+				if err != nil {
+					return fmt.Errorf("invalid chunk index: %w", err)
+				}
+
+				if messageChunks[chunkIdx] != nil {
+					return fmt.Errorf("duplicate chunk index %d received for JSON update ID %s", chunkIdx, jsonUpdateID)
+				}
+
+				messageChunks[chunkIdx] = msg.Data()
+				messagesSlice[chunkIdx] = msg
+				messageLen += len(messageChunks[chunkIdx])
+			}
+			return nil
+		}()
 		if err != nil {
-			return JSONUpdate{}, fmt.Errorf("error receiving JSON update message chunk: %w", err)
+			return JSONUpdate{}, fmt.Errorf("failed to process JSON update message chunks: %w", err)
 		}
-
-		chunkIdxStr := msg.Headers().Get("X-Chunk-Index")
-		chunkIdx, err := strconv.ParseInt(chunkIdxStr, 10, 32)
-		if err != nil {
-			return JSONUpdate{}, fmt.Errorf("invalid chunk index: %w", err)
-		}
-
-		if messageChunks[chunkIdx] != nil {
-			return JSONUpdate{}, fmt.Errorf("duplicate chunk index %d received for JSON update ID %s", chunkIdx, jsonUpdateID)
-		}
-
-		messageChunks[chunkIdx] = msg.Data()
-		messagesSlice[chunkIdx] = msg
-		messageLen += len(messageChunks[chunkIdx])
 	}
 
 	buffer := make([]byte, 0, messageLen)
@@ -139,8 +160,10 @@ func processJSONUpdateMessage(ctx context.Context, msg jetstream.Msg, jsonUpdate
 	return jsonUpdate, nil
 }
 
-func SubscribeJSONUpdate(ctx context.Context, jsonUpdateStream jetstream.Stream) (chan JSONUpdate, error) {
-	consumer, err := jsonUpdateStream.CreateConsumer(ctx, jetstream.ConsumerConfig{
+func SubscribeJSONUpdate(ctx context.Context, js jetstream.JetStream, jsonUpdateStream jetstream.Stream) (chan JSONUpdate, error) {
+	consumer, err := jsonUpdateStream.CreateOrUpdateConsumer(ctx, jetstream.ConsumerConfig{
+		Name:          "json_update_consumer",
+		Durable:       "json_update_consumer",
 		Description:   "JSON Update Stream Consumer",
 		FilterSubject: "loro.json_update.init",
 	})
@@ -165,7 +188,7 @@ func SubscribeJSONUpdate(ctx context.Context, jsonUpdateStream jetstream.Stream)
 			}
 
 			go func() {
-				update, err := processJSONUpdateMessage(ctx, msg, jsonUpdateStream)
+				update, err := processJSONUpdateMessage(ctx, js, msg, jsonUpdateStream)
 				if err != nil {
 					slog.Error("Error processing JSON update message", "error", err)
 					return

@@ -240,7 +240,7 @@ func SendLog(
 			}
 			currentSize += prevCount
 			if !firstWrite {
-				buffer := make([]byte, 0, prevCount)
+				buffer := make([]byte, prevCount)
 				// previous buffer
 				if writeA {
 					copy(buffer, bufferB[:prevCount])

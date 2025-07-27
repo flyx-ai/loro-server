@@ -18,6 +18,7 @@ export class CRDTDoc {
   hasInit = false;
   lastVVRequest: number = 0;
   lastSyncRequest: number = 0;
+  isDestroyed = false;
 
   constructor(
     documentID: string,
@@ -55,6 +56,7 @@ export class CRDTDoc {
         self.socket.binaryType = "arraybuffer";
         self.socket.onmessage = self.socketMsgHandler.bind(self);
         self.socket.onclose = function () {
+          if (self.isDestroyed) return;
           self.socketOpen = false;
           console.warn("Socket closed, attempting to reconnect in 1s...");
           setTimeout(initSocket, 1000);
@@ -174,6 +176,7 @@ export class CRDTDoc {
   }
 
   destroy() {
+    this.isDestroyed = true;
     console.log("destroying table...");
     clearInterval(this.intervalID);
     this.indexedDBProvider.destroy();

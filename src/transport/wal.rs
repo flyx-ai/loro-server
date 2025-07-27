@@ -57,17 +57,28 @@ fn save_last_seq(
                         let res = document_seq_kv
                             .update(id.clone(), last_seq_val, v.revision)
                             .await;
-                        if res.is_err() {
-                            continue;
+                        if let Err(e) = res {
+                            if e.kind()
+                                == async_nats::jetstream::kv::UpdateErrorKind::WrongLastRevision
+                            {
+                                continue;
+                            }
+
+                            tracing::error!("Failed to update last_seq entry: {:?}", e);
+                            return;
                         }
                     }
                 }
                 Ok(None) => {
                     let last_seq_val = Bytes::copy_from_slice(&last_seq_val_temp);
                     let res = document_seq_kv.create(id.clone(), last_seq_val).await;
-                    if res.is_err() {
-                        tracing::error!("Failed to create last_seq entry: {:?}", res);
-                        continue;
+                    if let Err(e) = res {
+                        if e.kind() == async_nats::jetstream::kv::CreateErrorKind::AlreadyExists {
+                            return;
+                        }
+
+                        tracing::error!("Failed to create last_seq entry: {:?}", e);
+                        return;
                     }
                 }
                 Err(e) => {

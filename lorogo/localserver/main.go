@@ -36,13 +36,13 @@ func main() {
 	if err != nil {
 		panic(err)
 	}
-	jsonUpdateChan, err := transport.SubscribeJSONUpdate(context.Background(), jsonUpdateStream)
+	jsonUpdateChan, err := transport.SubscribeJSONUpdate(context.Background(), js, jsonUpdateStream)
 	if err != nil {
 		panic(err)
 	}
 	go func() {
 		for update := range jsonUpdateChan {
-			slog.Info("Received JSON update", "documentID", update.DocumentID, "updateOps", update.UpdateOps)
+			slog.Info("Received JSON update", "documentID", update.DocumentID, "updateOps", len(update.UpdateOps))
 		}
 	}()
 
