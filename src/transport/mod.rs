@@ -1,6 +1,7 @@
 mod core_transport;
 mod document_endpoints;
 mod initialize;
+mod json_patch;
 mod json_update;
 mod serde;
 mod wal;

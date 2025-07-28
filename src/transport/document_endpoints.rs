@@ -30,6 +30,8 @@ pub async fn init_document_endpoints(
     let mut sync_down_subscriber = subscribe_endpoint(&nc, "sync_down", &document_id).await?;
     let mut version_vector_subscriber =
         subscribe_endpoint(&nc, "version_vector", &document_id).await?;
+    let mut patch_subscriber = subscribe_endpoint(&nc, "patch", &document_id).await?;
+    let mut get_subscriber = subscribe_endpoint(&nc, "get", &document_id).await?;
 
     loop {
         if !server_states.exists(document_id.clone()).await {
@@ -40,6 +42,8 @@ pub async fn init_document_endpoints(
             Some(msg) = ping_subscriber.next() => (msg, Endpoint::Ping),
             Some(msg) = sync_down_subscriber.next() => (msg, Endpoint::SyncDown),
             Some(msg) = version_vector_subscriber.next() => (msg, Endpoint::VersionVector),
+            Some(msg) = patch_subscriber.next() => (msg, Endpoint::Patch),
+            Some(msg) = get_subscriber.next() => (msg, Endpoint::Get),
         };
 
         let new_document_id = document_id.clone();
@@ -62,6 +66,8 @@ enum Endpoint {
     Ping,
     SyncDown,
     VersionVector,
+    Patch,
+    Get,
 }
 
 async fn process_message(
@@ -77,6 +83,8 @@ async fn process_message(
         Endpoint::VersionVector => {
             process_version_vector(msg, document_id, nc, server_states).await
         }
+        Endpoint::Patch => process_patch(msg, document_id, nc, server_states).await,
+        Endpoint::Get => process_get(msg, document_id, nc, server_states).await,
     }
 }
 
@@ -221,4 +229,102 @@ async fn process_version_vector(
 
     let vv = doc.oplog_vv().encode();
     send_ok(&responder, &nc, &vv).await;
+}
+
+async fn process_patch(
+    msg: super::core_transport::CoreMessage,
+    document_id: String,
+    nc: std::sync::Arc<async_nats::Client>,
+    server_states: std::sync::Arc<super::initialize::LoroServerStates>,
+) {
+    let Some(doc) = ensure_document(&msg, document_id.clone(), &nc, server_states).await else {
+        return;
+    };
+    let responder = msg.responder;
+
+    let patch: Result<super::json_patch::Patch, serde_json::Error> =
+        serde_json::from_slice(&msg.payload);
+    let patch = match patch {
+        Ok(patch) => patch,
+        Err(e) => {
+            send_error(&responder, &nc, &format!("failed to decode patch: {}", e)).await;
+            return;
+        }
+    };
+
+    let result = super::json_patch::patch_loro_document(doc, patch);
+    match result {
+        Ok(_) => {
+            send_ok(
+                &responder,
+                &nc,
+                format!("{{\"status\": \"ok\"}}").as_bytes(),
+            )
+            .await;
+        }
+        Err(e) => {
+            send_error(&responder, &nc, &format!("failed to apply patch: {}", e)).await;
+        }
+    }
+}
+
+async fn process_get(
+    msg: super::core_transport::CoreMessage,
+    document_id: String,
+    nc: std::sync::Arc<async_nats::Client>,
+    server_states: std::sync::Arc<super::initialize::LoroServerStates>,
+) {
+    let Some(doc) = ensure_document(&msg, document_id.clone(), &nc, server_states).await else {
+        return;
+    };
+    let responder = msg.responder;
+
+    let paths: Result<Vec<String>, serde_json::Error> = serde_json::from_slice(&msg.payload);
+    let paths = match paths {
+        Ok(paths) => paths,
+        Err(e) => {
+            send_error(&responder, &nc, &format!("failed to decode paths: {}", e)).await;
+            return;
+        }
+    };
+
+    let get_results = paths
+        .iter()
+        .map(|path| {
+            let res = doc.jsonpath(path);
+            match res {
+                Ok(value) => {
+                    let values: Result<
+                        Vec<super::serde::CRDTValue>,
+                        super::serde::LoroToSerdeError,
+                    > = value
+                        .into_iter()
+                        .map(|v| super::serde::loro_to_serde(v))
+                        .collect();
+                    let values = values.map(super::serde::CRDTValue::Array);
+                    match values {
+                        Ok(values) => values,
+                        Err(e) => {
+                            super::serde::CRDTValue::Map(std::collections::BTreeMap::from([(
+                                String::from("🦜error"),
+                                super::serde::CRDTValue::Value(serde_json::Value::String(
+                                    e.to_string(),
+                                )),
+                            )]))
+                        }
+                    }
+                }
+                Err(e) => super::serde::CRDTValue::Map(std::collections::BTreeMap::from([(
+                    String::from("🦜error"),
+                    super::serde::CRDTValue::Value(serde_json::Value::String(e.to_string())),
+                )])),
+            }
+        })
+        .collect::<Vec<_>>();
+
+    let res = serde_json::to_vec(&get_results);
+    match res {
+        Ok(res) => send_ok(&responder, &nc, &res).await,
+        Err(e) => send_error(&responder, &nc, &format!("failed to encode results: {}", e)).await,
+    };
 }
