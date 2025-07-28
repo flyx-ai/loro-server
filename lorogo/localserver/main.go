@@ -4,6 +4,7 @@ import (
 	"context"
 	"log/slog"
 	"net/http"
+	"os"
 
 	"github.com/flyx-ai/loro-server/lorogo/transport"
 	"github.com/flyx-ai/loro-server/lorogo/web"
@@ -12,7 +13,11 @@ import (
 )
 
 func main() {
-	nc, err := nats.Connect(nats.DefaultURL)
+	natsURL := os.Getenv("NATS_URL")
+	if natsURL == "" {
+		natsURL = nats.DefaultURL
+	}
+	nc, err := nats.Connect(natsURL)
 	if err != nil {
 		panic(err)
 	}
@@ -71,6 +76,22 @@ func main() {
 			err := web.CreateDocumentHandler(documentID, nc, documentStatusKV, w, r)
 			if err != nil {
 				slog.Error("Failed to create document", "documentID", documentID, "error", err)
+				http.Error(w, err.Error(), http.StatusInternalServerError)
+				return
+			}
+		}
+	})
+	mux.HandleFunc("/api/v1/document/{documentID}/purge", func(w http.ResponseWriter, r *http.Request) {
+		documentID := r.PathValue("documentID")
+		if documentID == "" {
+			http.Error(w, "documentID is required", http.StatusBadRequest)
+			return
+		}
+
+		if r.Method == http.MethodPost {
+			err := web.PurgeHandler(documentID, nc, w, r)
+			if err != nil {
+				slog.Error("Failed to purge document", "documentID", documentID, "error", err)
 				http.Error(w, err.Error(), http.StatusInternalServerError)
 				return
 			}

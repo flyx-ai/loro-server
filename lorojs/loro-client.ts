@@ -19,6 +19,8 @@ export class CRDTDoc {
   lastVVRequest: number = 0;
   lastSyncRequest: number = 0;
   isDestroyed = false;
+  documentID: string;
+  endpoint: string;
 
   constructor(
     documentID: string,
@@ -34,6 +36,8 @@ export class CRDTDoc {
     );
     this.intervalID = setInterval(self.syncCRDTChanges.bind(self), 1000);
     this.onInit = onInit;
+    this.documentID = documentID;
+    this.endpoint = endpoint;
 
     self.indexedDBProvider.waitForSync().then((empty) => {
       if (!empty) {
@@ -52,7 +56,9 @@ export class CRDTDoc {
 
     if (!offline) {
       function initSocket() {
-        self.socket = new WebSocket(endpoint);
+        self.socket = new WebSocket(
+          endpoint + "/api/v1/document/" + documentID + "/ws",
+        );
         self.socket.binaryType = "arraybuffer";
         self.socket.onmessage = self.socketMsgHandler.bind(self);
         self.socket.onclose = function () {
@@ -175,6 +181,16 @@ export class CRDTDoc {
     }
   }
 
+  // VERY DANGEROUS, REMOVES ALL DATA, USE WITH CAUTION
+  async purge() {
+    await fetch(
+      this.endpoint + "/api/v1/document/" + this.documentID + "/purge",
+      {
+        method: "POST",
+      },
+    );
+  }
+
   destroy() {
     this.isDestroyed = true;
     console.log("destroying table...");
@@ -182,4 +198,8 @@ export class CRDTDoc {
     this.indexedDBProvider.destroy();
     this.socket?.close();
   }
+}
+
+export async function createDocument(endpoint: string, documentID: string) {
+  await fetch(endpoint + "/api/v1/document/" + documentID, { method: "POST" });
 }

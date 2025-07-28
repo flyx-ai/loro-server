@@ -176,10 +176,16 @@ pub async fn init_loro_document(
         let document_id = document_id.clone();
         let nc = nc.clone();
         let server_states = server_states.clone();
+        let document_seq_kv = document_seq_kv.clone();
         tokio::spawn(async move {
-            if let Err(e) =
-                super::document_endpoints::init_document_endpoints(document_id, nc, server_states)
-                    .await
+            if let Err(e) = super::document_endpoints::init_document_endpoints(
+                document_id,
+                nc,
+                server_states,
+                wal_stream,
+                document_seq_kv,
+            )
+            .await
             {
                 tracing::error!("Failed to initialize document endpoints: {:?}", e);
             }

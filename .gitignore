@@ -3,3 +3,4 @@ node_modules/
 /.direnv/
 /tmp/
 /.cache/
+/kubeconfig

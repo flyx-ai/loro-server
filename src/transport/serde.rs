@@ -105,10 +105,6 @@ pub enum SerdeToLoroError {
     InvalidContainerValue(serde_json::Value),
     #[error("error while writing loro value: {0}")]
     WriteError(loro::LoroError),
-    #[error("tree content is not supported yet")]
-    TreeContentNotSupported(),
-    #[error("richtext content is not supported yet")]
-    RichTextContentNotSupported(),
     #[error("cannot assign a non-map value to loro doc root")]
     CannotAssignNonMapToRoot(),
     #[error("cannot assign a non-crdt value to loro doc root")]
@@ -191,7 +187,7 @@ fn serde_to_loro_int(
                         loro::ContainerType::Text => {
                             // TODO: Handle rich text content
                             if container_value.is_array() {
-                                return Err(SerdeToLoroError::RichTextContentNotSupported());
+                                unimplemented!("Rich text content is not supported yet");
                             }
 
                             let serde_json::Value::String(s) = container_value else {
@@ -306,9 +302,8 @@ fn serde_to_loro_int(
                             ));
                         }
                         loro::ContainerType::Tree => {
-                            // TODO: Handle tree content
                             if !container_value.is_null() {
-                                return Err(SerdeToLoroError::TreeContentNotSupported());
+                                unimplemented!("Tree content is not supported yet");
                             }
                             let container = if let (Some(r), Some(id)) = (root, root_container) {
                                 r.get_tree(id)

@@ -20,6 +20,9 @@
             bun
             nats-server
           ];
+          shellHook = ''
+            export KUBECONFIG=$(realpath ./kubeconfig)
+          '';
         };
       }
     );

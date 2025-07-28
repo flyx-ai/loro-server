@@ -17,3 +17,11 @@ func CreateDocumentHandler(documentID string, nc *nats.Conn, documentStatusKV je
 	}
 	return nil
 }
+
+func PurgeHandler(documentID string, nc *nats.Conn, w http.ResponseWriter, r *http.Request) error {
+	err := transport.Purge(context.Background(), nc, documentID)
+	if err != nil {
+		return fmt.Errorf("failed to purge document %s: %w", documentID, err)
+	}
+	return nil
+}

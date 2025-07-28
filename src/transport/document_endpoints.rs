@@ -24,6 +24,8 @@ pub async fn init_document_endpoints(
     document_id: String,
     nc: std::sync::Arc<async_nats::Client>,
     server_states: std::sync::Arc<super::initialize::LoroServerStates>,
+    wal_stream: std::sync::Arc<async_nats::jetstream::stream::Stream>,
+    document_seq_kv: std::sync::Arc<async_nats::jetstream::kv::Store>,
 ) -> Result<(), InitDocumentEndpointsError> {
     tracing::info!("Initializing document endpoints for {}", document_id);
     let mut ping_subscriber = subscribe_endpoint(&nc, "ping", &document_id).await?;
@@ -32,6 +34,7 @@ pub async fn init_document_endpoints(
         subscribe_endpoint(&nc, "version_vector", &document_id).await?;
     let mut patch_subscriber = subscribe_endpoint(&nc, "patch", &document_id).await?;
     let mut get_subscriber = subscribe_endpoint(&nc, "get", &document_id).await?;
+    let mut purge_subscriber = subscribe_endpoint(&nc, "purge", &document_id).await?;
 
     loop {
         if !server_states.exists(document_id.clone()).await {
@@ -44,11 +47,14 @@ pub async fn init_document_endpoints(
             Some(msg) = version_vector_subscriber.next() => (msg, Endpoint::VersionVector),
             Some(msg) = patch_subscriber.next() => (msg, Endpoint::Patch),
             Some(msg) = get_subscriber.next() => (msg, Endpoint::Get),
+            Some(msg) = purge_subscriber.next() => (msg, Endpoint::Purge),
         };
 
         let new_document_id = document_id.clone();
         let new_nc = nc.clone();
         let new_server_states = server_states.clone();
+        let new_wal_stream = wal_stream.clone();
+        let new_document_seq_kv = document_seq_kv.clone();
         tokio::spawn(async move {
             process_message(
                 endpoint.1,
@@ -56,6 +62,8 @@ pub async fn init_document_endpoints(
                 new_document_id,
                 new_nc,
                 new_server_states,
+                new_wal_stream,
+                new_document_seq_kv,
             )
             .await
         });
@@ -68,6 +76,7 @@ enum Endpoint {
     VersionVector,
     Patch,
     Get,
+    Purge,
 }
 
 async fn process_message(
@@ -76,6 +85,8 @@ async fn process_message(
     document_id: String,
     nc: std::sync::Arc<async_nats::Client>,
     server_states: std::sync::Arc<super::initialize::LoroServerStates>,
+    wal_stream: std::sync::Arc<async_nats::jetstream::stream::Stream>,
+    document_seq_kv: std::sync::Arc<async_nats::jetstream::kv::Store>,
 ) {
     match endpoint {
         Endpoint::Ping => process_ping(msg, document_id, nc, server_states).await,
@@ -85,6 +96,17 @@ async fn process_message(
         }
         Endpoint::Patch => process_patch(msg, document_id, nc, server_states).await,
         Endpoint::Get => process_get(msg, document_id, nc, server_states).await,
+        Endpoint::Purge => {
+            process_purge(
+                msg,
+                document_id,
+                nc,
+                server_states,
+                wal_stream,
+                document_seq_kv,
+            )
+            .await
+        }
     }
 }
 
@@ -327,4 +349,43 @@ async fn process_get(
         Ok(res) => send_ok(&responder, &nc, &res).await,
         Err(e) => send_error(&responder, &nc, &format!("failed to encode results: {}", e)).await,
     };
+}
+
+async fn process_purge(
+    msg: super::core_transport::CoreMessage,
+    document_id: String,
+    nc: std::sync::Arc<async_nats::Client>,
+    server_states: std::sync::Arc<super::initialize::LoroServerStates>,
+    wal_stream: std::sync::Arc<async_nats::jetstream::stream::Stream>,
+    document_seq_kv: std::sync::Arc<async_nats::jetstream::kv::Store>,
+) {
+    let responder = msg.responder;
+
+    tracing::info!("Purging document {}", document_id);
+
+    server_states.clone().remove(document_id.clone()).await;
+
+    document_seq_kv
+        .delete(format!("loro.doc.{}", document_id))
+        .await
+        .map_err(|e| {
+            tracing::error!("Failed to delete document seq from KV: {}", e);
+            e
+        })
+        .ok();
+
+    // TODO: purge snapshots when implemented
+    let res = wal_stream
+        .purge()
+        .filter(format!("loro.wal.{}", document_id))
+        .await;
+    if let Err(e) = res {
+        tracing::error!("Failed to purge WAL for document {}: {}", document_id, e);
+        send_error(&responder, &nc, "failed to purge WAL").await;
+        return;
+    }
+
+    tracing::info!("Purged WAL for document {}", document_id);
+
+    send_ok_string(&responder, &nc, "{{\"status\": \"ok\"}}").await;
 }

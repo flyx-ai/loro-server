@@ -84,7 +84,7 @@ impl LoroServerStates {
         states.keys().cloned().collect()
     }
 
-    async fn remove(&self, id: String) {
+    pub async fn remove(&self, id: String) {
         let mut states = self.states.write().await;
         states.remove(&id);
     }
