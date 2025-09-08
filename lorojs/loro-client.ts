@@ -13,8 +13,10 @@ export class CRDTDoc {
   socketOpen = false;
   indexedDBProvider: IndexedDBPersistence;
   indexedDBSynced = false;
-  intervalID: NodeJS.Timeout;
+  intervalID: number;
   onInit?: () => void;
+  isFirstSyncDone = false;
+  onFirstSync?: () => void;
   hasInit = false;
   lastVVRequest: number = 0;
   lastSyncRequest: number = 0;
@@ -26,103 +28,108 @@ export class CRDTDoc {
     documentID: string,
     endpoint: string,
     onInit?: () => void,
+    onFirstSync?: () => void,
     offline?: boolean,
   ) {
-    const self = this;
     this.doc = new LoroDoc();
     this.indexedDBProvider = new IndexedDBPersistence(
       "crdt-document-" + documentID,
-      self.doc,
+      this.doc,
     );
-    this.intervalID = setInterval(self.syncCRDTChanges.bind(self), 1000);
+    this.intervalID = setInterval(
+      this.syncCRDTChanges.bind(this),
+      1000,
+    ) as unknown as number;
     this.onInit = onInit;
+    this.onFirstSync = onFirstSync;
     this.documentID = documentID;
     this.endpoint = endpoint;
 
-    self.indexedDBProvider.waitForSync().then((empty) => {
+    this.indexedDBProvider.waitForSync().then((empty) => {
       if (!empty) {
-        self.indexedDBSynced = true;
-        if (!self.hasInit) {
-          self.onInit?.();
-          self.hasInit = true;
+        this.indexedDBSynced = true;
+        if (!this.hasInit) {
+          this.hasInit = true;
+          this.onInit?.();
         }
-        self.syncCRDTChanges();
+        this.syncCRDTChanges();
       }
     });
 
-    self.doc.subscribeLocalUpdates((update) => {
+    this.doc.subscribeLocalUpdates((update) => {
       this.sendBinarySocketMessage(WS_BIN_REQUEST_TYPE_CRDT, update);
     });
 
     if (!offline) {
-      function initSocket() {
-        self.socket = new WebSocket(
+      const initSocket = () => {
+        this.socket = new WebSocket(
           endpoint + "/api/v1/document/" + documentID + "/ws",
         );
-        self.socket.binaryType = "arraybuffer";
-        self.socket.onmessage = self.socketMsgHandler.bind(self);
-        self.socket.onclose = function () {
-          if (self.isDestroyed) return;
-          self.socketOpen = false;
+        this.socket.binaryType = "arraybuffer";
+        this.socket.onmessage = this.socketMsgHandler.bind(this);
+        this.socket.onclose = () => {
+          if (this.isDestroyed) return;
+          this.socketOpen = false;
           console.warn("Socket closed, attempting to reconnect in 1s...");
           setTimeout(initSocket, 1000);
         };
-        self.socket.onerror = function (err) {
+        this.socket.onerror = (err: unknown) => {
           console.error("Socket error:", err);
-          self.socket?.close();
+          this.socket?.close();
         };
-        self.socket.onopen = () => {
-          self.socketOpen = true;
-          self.syncCRDTChanges();
+        this.socket.onopen = () => {
+          this.socketOpen = true;
+          this.syncCRDTChanges();
         };
-      }
-      initSocket();
+      };
+      initSocket.bind(this)();
     }
   }
 
   sendBinarySocketMessage(messageType: number, data: Uint8Array): boolean {
-    const self = this;
-    if (!self.socket || self.socket.readyState !== WebSocket.OPEN) return false;
+    if (!this.socket || this.socket.readyState !== WebSocket.OPEN) return false;
     const newData = new Uint8Array(data.length + 1);
     newData[0] = messageType;
     newData.set(data, 1);
-    self.socket.send(newData);
+    this.socket.send(newData);
     return true;
   }
 
   sendTextSocketMessage(messageType: number, data: unknown): boolean {
-    const self = this;
-    if (!self.socket || self.socket.readyState !== WebSocket.OPEN) return false;
-    self.socket.send(JSON.stringify([messageType, data]));
+    if (!this.socket || this.socket.readyState !== WebSocket.OPEN) return false;
+    this.socket.send(JSON.stringify([messageType, data]));
     return true;
   }
 
   socketMsgHandler(event: MessageEvent) {
-    const self = this;
     if (event.data instanceof ArrayBuffer) {
       const rawData = new Uint8Array(event.data);
       const messageType = rawData[0];
       const data = rawData.slice(1);
       switch (messageType) {
         case WS_BIN_RESPONSE_TYPE_CRDT: {
-          self.doc.import(data);
+          this.doc.import(data);
+          if (!this.isFirstSyncDone) {
+            this.isFirstSyncDone = true;
+            this.onFirstSync?.();
+          }
           break;
         }
         case WS_BIN_RESPONSE_TYPE_VV: {
           const now = Date.now();
-          if (!self.indexedDBSynced || now - self.lastVVRequest < 1000) {
+          if (!this.indexedDBSynced || now - this.lastVVRequest < 1000) {
             break;
           } else {
-            self.lastVVRequest = now;
+            this.lastVVRequest = now;
           }
           const vv = VersionVector.decode(data);
-          const localVV = self.doc.oplogVersion();
+          const localVV = this.doc.oplogVersion();
           const cmpResult = localVV.compare(vv);
           if (cmpResult !== undefined && cmpResult <= 0) {
             break;
           }
-          const update = self.doc.export({ mode: "update", from: vv });
-          self.sendBinarySocketMessage(WS_BIN_REQUEST_TYPE_CRDT, update);
+          const update = this.doc.export({ mode: "update", from: vv });
+          this.sendBinarySocketMessage(WS_BIN_REQUEST_TYPE_CRDT, update);
           break;
         }
         default: {
@@ -163,21 +170,20 @@ export class CRDTDoc {
   }
 
   syncCRDTChanges() {
-    const self = this;
-    if (!self.socket || self.socket.readyState !== WebSocket.OPEN) return;
-    if (!self.indexedDBSynced) return;
+    if (!this.socket || this.socket.readyState !== WebSocket.OPEN) return;
+    if (!this.indexedDBSynced) return;
     const now = Date.now();
-    if (now - self.lastSyncRequest < 1000) {
+    if (now - this.lastSyncRequest < 1000) {
       return;
     } else {
-      self.lastSyncRequest = now;
+      this.lastSyncRequest = now;
     }
-    const vv = self.doc.oplogVersion();
+    const vv = this.doc.oplogVersion();
     const encodedVV = vv.encode();
-    self.sendBinarySocketMessage(WS_BIN_REQUEST_TYPE_SYNC, encodedVV);
-    if (!self.hasInit) {
-      self.onInit?.();
-      self.hasInit = true;
+    this.sendBinarySocketMessage(WS_BIN_REQUEST_TYPE_SYNC, encodedVV);
+    if (!this.hasInit) {
+      this.hasInit = true;
+      this.onInit?.();
     }
   }
 

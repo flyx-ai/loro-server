@@ -1,6 +1,5 @@
 mod time;
 mod transport;
-mod webserver;
 
 use async_nats::service::ServiceExt;
 use std::env;
@@ -26,8 +25,11 @@ pub enum LoroServerError {
 async fn main() -> Result<(), LoroServerError> {
     tracing_subscriber::fmt()
         .with_max_level(tracing::Level::INFO)
-        .with_env_filter(tracing_subscriber::EnvFilter::new("info,loro_internal=warn"))
+        .with_env_filter(tracing_subscriber::EnvFilter::new(
+            "info,loro_internal=warn",
+        ))
         .init();
+    // console_subscriber::init();
 
     let nats_url = env::var("NATS_URL").unwrap_or_else(|_| "nats://127.0.0.1:4222".to_string());
     let nats_client = async_nats::connect(nats_url).await?;
@@ -47,8 +49,6 @@ async fn main() -> Result<(), LoroServerError> {
     transport::init_loro_server(nc.clone(), js.clone(), &loro_service).await?;
 
     info!("Loro server started");
-
-    webserver::init_webserver(nc.clone(), js.clone()).await;
 
     tokio::signal::ctrl_c().await?;
 

@@ -39,6 +39,20 @@ pub enum PatchErrorKind {
     LoroError(#[from] loro::LoroError),
 }
 
+fn safe_get_by_str_path(
+    doc: std::sync::Arc<loro::LoroDoc>,
+    path: &jsonptr::Pointer,
+) -> Option<loro::ValueOrContainer> {
+    let s = &path.to_string();
+    if s.chars().next() == Some('/') {
+        let mut chars = s.chars();
+        chars.next();
+        doc.get_by_str_path(chars.as_str())
+    } else {
+        doc.get_by_str_path(s)
+    }
+}
+
 /// This type represents all possible errors that can occur when applying JSON patch
 #[derive(thiserror::Error, Debug)]
 #[error("operation '/{operation}' failed at path '{path}': {kind}")]
@@ -347,16 +361,10 @@ fn add_rec(
                     let Ok(idx) = idx.for_len(l.len()) else {
                         return Err(PatchErrorKind::InvalidPointerOOB(first.to_string()));
                     };
-                    if let Some(v) = add_rec(
-                        doc,
-                        &mut loro::ValueOrContainer::Container(loro::Container::MovableList(
-                            l.clone(),
-                        )),
-                        rest,
-                        value,
-                        undo_stack,
-                        full_path,
-                    )? {
+                    let Some(mut val) = l.get(idx) else {
+                        return Err(PatchErrorKind::InvalidPointerOOB(first.to_string()));
+                    };
+                    if let Some(v) = add_rec(doc, &mut val, rest, value, undo_stack, full_path)? {
                         l.delete(idx, 1)?;
                         match v {
                             loro::ValueOrContainer::Value(v) => {
@@ -528,6 +536,9 @@ fn add_rec(
                         new_value =
                             loro::ValueOrContainer::Value(loro::LoroValue::Map(new_map.into()))
                     } else {
+                        if full_path == path {
+                            return Ok(None);
+                        }
                         unreachable!("add_rec should return a ValueOrContainer::Value here");
                     }
                 }
@@ -951,6 +962,9 @@ fn remove_rec(
                         new_value =
                             loro::ValueOrContainer::Value(loro::LoroValue::Map(new_map.into()))
                     } else {
+                        if full_path == path {
+                            return Ok(None);
+                        }
                         unreachable!("remove_rec should return a ValueOrContainer::Value here");
                     }
                 }
@@ -1200,16 +1214,11 @@ fn replace_rec(
                     let Ok(idx) = idx.for_len(l.len()) else {
                         return Err(PatchErrorKind::InvalidPointerOOB(first.to_string()));
                     };
-                    if let Some(v) = replace_rec(
-                        doc,
-                        &mut loro::ValueOrContainer::Container(loro::Container::MovableList(
-                            l.clone(),
-                        )),
-                        rest,
-                        value,
-                        undo_stack,
-                        full_path,
-                    )? {
+                    let Some(mut val) = l.get(idx) else {
+                        return Err(PatchErrorKind::InvalidPointerOOB(first.to_string()));
+                    };
+                    if let Some(v) = replace_rec(doc, &mut val, rest, value, undo_stack, full_path)?
+                    {
                         l.delete(idx, 1)?;
                         match v {
                             loro::ValueOrContainer::Value(v) => {
@@ -1386,6 +1395,9 @@ fn replace_rec(
                         new_value =
                             loro::ValueOrContainer::Value(loro::LoroValue::Map(new_map.into()))
                     } else {
+                        if full_path == path {
+                            return Ok(None);
+                        }
                         unreachable!("replace_rec should return a ValueOrContainer::Value here");
                     }
                 }
@@ -1504,7 +1516,7 @@ fn mov(
     };
 
     if from_first == path_first {
-        let parent = doc.get_by_str_path(&from_first.to_string());
+        let parent = safe_get_by_str_path(doc.clone(), &from_first);
         if let Some(loro::ValueOrContainer::Container(c)) = parent {
             if let loro::Container::MovableList(l) = c {
                 let Ok(from_idx) = from_last.to_index() else {
@@ -1583,7 +1595,7 @@ fn copy(
         return Err(PatchErrorKind::CannotAddToRootWithoutCrdtValue);
     };
 
-    let from_val = doc.get_by_str_path(&from.to_string());
+    let from_val = safe_get_by_str_path(doc.clone(), &from);
     if let Some(loro::ValueOrContainer::Value(v)) = from_val {
         add_loro(
             doc,
@@ -1606,8 +1618,7 @@ fn test(
         return Err(PatchErrorKind::CannotAddToRootWithoutCrdtValue);
     };
 
-    let val = doc
-        .get_by_str_path(&path.to_string())
+    let val = safe_get_by_str_path(doc.clone(), &path)
         .ok_or(PatchErrorKind::InvalidPointerNotFound(path.to_string()))?;
     let loro::ValueOrContainer::Value(expected_loro) =
         super::serde::serde_to_loro(expected.clone())

@@ -1,11 +1,12 @@
 use bytes::Bytes;
 use futures::{FutureExt, StreamExt};
 use std::hash::Hasher;
-use thiserror::Error;
+
+const CHUNK_SIZE: usize = 128 * 1024; // 128 KiB
 
 type NatsGenericError = Box<dyn std::error::Error + Send + Sync + 'static>;
 
-#[derive(Error, Debug)]
+#[derive(thiserror::Error, Debug)]
 pub enum LoroInitDocumentError {
     #[error("failed to create WAL consumer: {0}")]
     CreateConsumerError(async_nats::jetstream::stream::ConsumerError),
@@ -67,6 +68,8 @@ fn save_last_seq(
                             tracing::error!("Failed to update last_seq entry: {:?}", e);
                             return;
                         }
+                    } else {
+                        return;
                     }
                 }
                 Ok(None) => {
@@ -175,12 +178,14 @@ pub async fn init_loro_document(
     {
         let document_id = document_id.clone();
         let nc = nc.clone();
+        let js = js.clone();
         let server_states = server_states.clone();
         let document_seq_kv = document_seq_kv.clone();
         tokio::spawn(async move {
             if let Err(e) = super::document_endpoints::init_document_endpoints(
                 document_id,
                 nc,
+                js,
                 server_states,
                 wal_stream,
                 document_seq_kv,
@@ -278,7 +283,8 @@ async fn process_messages(
                 let new_loro_doc = loro_doc.clone();
                 let new_document_id = document_id.clone();
                 tokio::spawn(async move {
-                    let json_update = new_loro_doc.export_json_updates(&old_vv, &new_vv);
+                    let json_update =
+                        new_loro_doc.export_json_updates_without_peer_compression(&old_vv, &new_vv);
                     let document_id = new_document_id;
                     let res = super::json_update::export_json_update(
                         new_nc,
@@ -404,7 +410,7 @@ async fn process_message_wrapper(
     }
 }
 
-#[derive(Error, Debug)]
+#[derive(thiserror::Error, Debug)]
 struct MalformedMessageError {
     response_inbox: Option<String>,
     message: String,
@@ -566,4 +572,91 @@ fn process_message(
     }
 
     Ok(None)
+}
+
+#[derive(thiserror::Error, Debug)]
+pub enum SendLogError {
+    #[error("failed to subscribe to response inbox: {0}")]
+    SubscribeInboxError(async_nats::SubscribeError),
+    #[error("timed out waiting for response")]
+    TimeoutWaitingForResponse,
+    #[error("nats response malformed: {0}")]
+    NatsResponseMalformed(String),
+    #[error("error processing message: {0}")]
+    MessageProcessingError(String),
+}
+
+pub async fn send_log(
+    document_id: String,
+    nc: std::sync::Arc<async_nats::Client>,
+    js: std::sync::Arc<async_nats::jetstream::Context>,
+    body: &Vec<u8>,
+) -> Result<(), SendLogError> {
+    let log_id = nanoid::nanoid!();
+    let mut current_size = 0;
+    let mut hasher = twox_hash::XxHash64::with_seed(0);
+    let mut chunk_idx = 0;
+
+    let response_inbox = format!("loro.response.{}", nanoid::nanoid!());
+    let mut subscription = nc
+        .subscribe(response_inbox.clone())
+        .await
+        .map_err(SendLogError::SubscribeInboxError)?;
+
+    for chunk in body.chunks(CHUNK_SIZE) {
+        hasher.write(&chunk);
+        current_size += chunk.len();
+
+        let document_id = document_id.clone();
+        let mut headers = async_nats::HeaderMap::new();
+        headers.append("LORO_LOG_ID", log_id.clone());
+        headers.append("LORO_CHUNK_INDEX", chunk_idx.to_string());
+        if current_size >= body.len() {
+            headers.append("LORO_FINAL", "true".to_string());
+            headers.append("LORO_DIGEST", hasher.finish().to_string());
+            headers.append("LORO_RESPONSE_INBOX", response_inbox.clone());
+        }
+        chunk_idx += 1;
+        let js = js.clone();
+        let cloned_chunk = chunk.to_vec();
+        tokio::spawn(async move {
+            js.publish_with_headers(
+                format!("loro.wal.{}", document_id),
+                headers,
+                bytes::Bytes::from_owner(cloned_chunk),
+            )
+            .await
+            .map_err(|e| {
+                tracing::error!("Failed to publish message: {}", e);
+            })
+        });
+    }
+
+    loop {
+        let msg =
+            tokio::time::timeout(std::time::Duration::from_secs(5), subscription.next()).await;
+        let msg = match msg {
+            Ok(msg) => msg.ok_or(SendLogError::NatsResponseMalformed("".to_string()))?,
+            Err(_) => return Err(SendLogError::TimeoutWaitingForResponse),
+        };
+        let payload = String::from_utf8_lossy(&msg.payload);
+        if payload == "ACK" {
+            return Ok(());
+        }
+
+        match payload.strip_prefix("NACK:") {
+            Some(_) => {
+                return Err(SendLogError::MessageProcessingError(format!(
+                    "Log has failed to process: {}",
+                    payload
+                )));
+            }
+            None => {
+                return Err(SendLogError::NatsResponseMalformed(format!(
+                    "Unknown response: {}",
+                    payload
+                )));
+            }
+        }
+    }
 }

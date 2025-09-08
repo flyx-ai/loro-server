@@ -277,7 +277,7 @@ func SendLog(
 	responseInbox := "loro.response." + gonanoid.Must()
 	responseChan := make(chan struct{})
 
-	_, err = nc.Subscribe(responseInbox, func(msg *nats.Msg) {
+	subscription, err := nc.Subscribe(responseInbox, func(msg *nats.Msg) {
 		msgStr := string(msg.Data)
 		if msgStr == "ACK" {
 			responseChan <- struct{}{}
@@ -293,6 +293,13 @@ func SendLog(
 	if err != nil {
 		return fmt.Errorf("failed to subscribe to response inbox %s: %w", responseInbox, err)
 	}
+
+	defer func() {
+		err := subscription.Unsubscribe()
+		if err != nil {
+			slog.Error("failed to unsubscribe from response inbox", "inbox", responseInbox, "error", err)
+		}
+	}()
 
 	var buffer []byte
 	if !writeA {

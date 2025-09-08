@@ -1,6 +1,5 @@
 use futures::StreamExt;
 use std::hash::Hasher;
-use thiserror::Error;
 
 const CHUNK_SIZE: usize = 128 * 1024; // 128 KiB
 
@@ -28,7 +27,7 @@ struct ChunkStoreEntry {
     timeout_cancel_sender: Option<tokio::sync::oneshot::Sender<()>>,
 }
 
-#[derive(Error, Debug)]
+#[derive(thiserror::Error, Debug)]
 pub enum SendResponseError {
     #[error("failed to join tasks: {0}")]
     JoinError(tokio::task::JoinError),
@@ -36,7 +35,7 @@ pub enum SendResponseError {
     PublishError(async_nats::PublishError),
 }
 
-#[derive(Error, Debug)]
+#[derive(thiserror::Error, Debug)]
 pub enum ProcessMessageError {
     #[error("failed to process message: {0}")]
     MessageProcessingError(String),
@@ -392,7 +391,7 @@ impl futures::Stream for CoreSubscriber {
     }
 }
 
-#[derive(Error, Debug)]
+#[derive(thiserror::Error, Debug)]
 pub enum MakeRequestError {
     #[error("failed to subscribe to inbox: {0}")]
     SubscribeError(async_nats::SubscribeError),

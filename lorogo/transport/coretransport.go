@@ -34,7 +34,7 @@ func MakeRequest(
 
 	messageID := gonanoid.Must()
 	responseInbox := nats.NewInbox()
-	responseChan := make(chan *nats.Msg)
+	responseChan := make(chan *nats.Msg, 64)
 
 	var errChan = make(chan error, 1)
 	var resultChan = make(chan CoreResponse, 1)
@@ -46,6 +46,9 @@ func MakeRequest(
 	defer func() {
 		err = subscriber.Unsubscribe()
 		if err != nil {
+			if errors.Is(err, nats.ErrConnectionClosed) || errors.Is(err, nats.ErrBadSubscription) {
+				return
+			}
 			slog.Error("failed to unsubscribe from response inbox", "error", err)
 		}
 	}()
@@ -119,6 +122,11 @@ func MakeRequest(
 					StatusCode: statusCode,
 					Payload:    buffer,
 				}
+				err := subscriber.Unsubscribe()
+				if err != nil {
+					errChan <- fmt.Errorf("failed to unsubscribe from response inbox: %w", err)
+				}
+				return
 			}
 		}
 	}()

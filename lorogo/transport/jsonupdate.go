@@ -176,7 +176,7 @@ func SubscribeJSONUpdate(ctx context.Context, js jetstream.JetStream, jsonUpdate
 		return nil, fmt.Errorf("failed to get messages from JSON update consumer: %w", err)
 	}
 
-	updateChan := make(chan JSONUpdate)
+	updateChan := make(chan JSONUpdate, 64)
 
 	go func() {
 		defer messages.Stop()

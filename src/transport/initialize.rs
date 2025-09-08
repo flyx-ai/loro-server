@@ -1,9 +1,8 @@
 use futures::StreamExt;
-use thiserror::Error;
 
 type NatsGenericError = Box<dyn std::error::Error + Send + Sync + 'static>;
 
-#[derive(Error, Debug)]
+#[derive(thiserror::Error, Debug)]
 pub enum LoroServerInitError {
     #[error("nats service endpoint start failed: {0}")]
     NatsServiceEndpointStartFailed(NatsGenericError),
@@ -201,7 +200,7 @@ pub async fn init_loro_server(
     Ok(())
 }
 
-#[derive(Error, Debug)]
+#[derive(thiserror::Error, Debug)]
 pub enum LoroServerDocumentCheckError {
     #[error("failed to get document status: {0}")]
     GetDocumentStatusError(#[from] async_nats::jetstream::kv::EntryError),
@@ -383,7 +382,7 @@ async fn check_document(
     Ok(())
 }
 
-#[derive(Error, Debug)]
+#[derive(thiserror::Error, Debug)]
 pub enum LoroServerInitServiceError {
     #[error("failed to decode table id from subject: {0}")]
     DecodeTableIDError(String),

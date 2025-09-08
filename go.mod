@@ -4,9 +4,9 @@ go 1.24.1
 
 require (
 	github.com/cespare/xxhash/v2 v2.3.0
-	github.com/coder/websocket v1.8.13
+	github.com/coder/websocket v1.8.14
 	github.com/matoous/go-nanoid/v2 v2.1.0
-	github.com/nats-io/nats.go v1.43.0
+	github.com/nats-io/nats.go v1.45.0
 	github.com/puzpuzpuz/xsync/v4 v4.1.0
 )
 
@@ -30,9 +30,9 @@ require (
 	github.com/spf13/afero v1.14.0 // indirect
 	github.com/spf13/cast v1.8.0 // indirect
 	github.com/tdewolff/parse/v2 v2.8.1 // indirect
-	golang.org/x/crypto v0.37.0 // indirect
-	golang.org/x/sys v0.33.0 // indirect
-	golang.org/x/text v0.25.0 // indirect
+	golang.org/x/crypto v0.42.0 // indirect
+	golang.org/x/sys v0.36.0 // indirect
+	golang.org/x/text v0.29.0 // indirect
 	google.golang.org/protobuf v1.36.6 // indirect
 )
 

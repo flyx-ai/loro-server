@@ -105,6 +105,7 @@ func documentInputBinaryHandler(
 		go func() {
 			defer wg.Done()
 
+			// TODO: batch this
 			err := nc.PublishMsg(&nats.Msg{
 				Subject: fmt.Sprintf("crdt.%s.update", documentID),
 				Data:    data,
@@ -317,13 +318,14 @@ func TableListenHandler(
 			}
 
 			go func() {
-				if msgType == websocket.MessageBinary {
+				switch msgType {
+				case websocket.MessageBinary:
 					err := documentInputBinaryHandler(ctx, nc, js, documentStatusKV, data, documentID, clientID, binaryChan)
 					if err != nil {
 						errCh <- fmt.Errorf("failed to handle binary message: %w", err)
 						return
 					}
-				} else if msgType == websocket.MessageText {
+				case websocket.MessageText:
 					err := documentInputTextHandler(ctx, data, documentID, clientID, awarenessState, binaryChan)
 					if err != nil {
 						errCh <- fmt.Errorf("failed to handle text message: %w", err)

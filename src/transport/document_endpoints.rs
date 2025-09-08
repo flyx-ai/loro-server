@@ -1,7 +1,6 @@
 use futures::StreamExt;
-use thiserror::Error;
 
-#[derive(Error, Debug)]
+#[derive(thiserror::Error, Debug)]
 pub enum InitDocumentEndpointsError {
     #[error("failed to subscribe to endpoint subject: {0}")]
     SubscribeSubjectError(async_nats::SubscribeError),
@@ -23,6 +22,7 @@ async fn subscribe_endpoint(
 pub async fn init_document_endpoints(
     document_id: String,
     nc: std::sync::Arc<async_nats::Client>,
+    js: std::sync::Arc<async_nats::jetstream::Context>,
     server_states: std::sync::Arc<super::initialize::LoroServerStates>,
     wal_stream: std::sync::Arc<async_nats::jetstream::stream::Stream>,
     document_seq_kv: std::sync::Arc<async_nats::jetstream::kv::Store>,
@@ -52,6 +52,7 @@ pub async fn init_document_endpoints(
 
         let new_document_id = document_id.clone();
         let new_nc = nc.clone();
+        let new_js = js.clone();
         let new_server_states = server_states.clone();
         let new_wal_stream = wal_stream.clone();
         let new_document_seq_kv = document_seq_kv.clone();
@@ -61,6 +62,7 @@ pub async fn init_document_endpoints(
                 endpoint.0,
                 new_document_id,
                 new_nc,
+                new_js,
                 new_server_states,
                 new_wal_stream,
                 new_document_seq_kv,
@@ -84,6 +86,7 @@ async fn process_message(
     msg: super::core_transport::CoreMessage,
     document_id: String,
     nc: std::sync::Arc<async_nats::Client>,
+    js: std::sync::Arc<async_nats::jetstream::Context>,
     server_states: std::sync::Arc<super::initialize::LoroServerStates>,
     wal_stream: std::sync::Arc<async_nats::jetstream::stream::Stream>,
     document_seq_kv: std::sync::Arc<async_nats::jetstream::kv::Store>,
@@ -94,7 +97,7 @@ async fn process_message(
         Endpoint::VersionVector => {
             process_version_vector(msg, document_id, nc, server_states).await
         }
-        Endpoint::Patch => process_patch(msg, document_id, nc, server_states).await,
+        Endpoint::Patch => process_patch(msg, document_id, nc, js, server_states).await,
         Endpoint::Get => process_get(msg, document_id, nc, server_states).await,
         Endpoint::Purge => {
             process_purge(
@@ -176,6 +179,7 @@ async fn process_ping(
     nc: std::sync::Arc<async_nats::Client>,
     server_states: std::sync::Arc<super::initialize::LoroServerStates>,
 ) {
+    tracing::info!("Processing ping for document {}", document_id);
     let exists = server_states.exists(document_id.clone()).await;
     send_ok_string(&msg.responder, &nc, if exists { "pong" } else { "not_up" }).await;
 }
@@ -186,6 +190,7 @@ async fn process_sync_down(
     nc: std::sync::Arc<async_nats::Client>,
     server_states: std::sync::Arc<super::initialize::LoroServerStates>,
 ) {
+    tracing::info!("Processing sync_down for document {}", document_id);
     let Some(doc) = ensure_document(&msg, document_id.clone(), &nc, server_states).await else {
         return;
     };
@@ -244,6 +249,7 @@ async fn process_version_vector(
     nc: std::sync::Arc<async_nats::Client>,
     server_states: std::sync::Arc<super::initialize::LoroServerStates>,
 ) {
+    tracing::info!("Processing version_vector for document {}", document_id);
     let Some(doc) = ensure_document(&msg, document_id.clone(), &nc, server_states).await else {
         return;
     };
@@ -257,12 +263,16 @@ async fn process_patch(
     msg: super::core_transport::CoreMessage,
     document_id: String,
     nc: std::sync::Arc<async_nats::Client>,
+    js: std::sync::Arc<async_nats::jetstream::Context>,
     server_states: std::sync::Arc<super::initialize::LoroServerStates>,
 ) {
+    tracing::info!("Processing patch for document {}", document_id);
     let Some(doc) = ensure_document(&msg, document_id.clone(), &nc, server_states).await else {
         return;
     };
     let responder = msg.responder;
+
+    let prev_vv = doc.oplog_vv().clone();
 
     let patch: Result<super::json_patch::Patch, serde_json::Error> =
         serde_json::from_slice(&msg.payload);
@@ -274,9 +284,63 @@ async fn process_patch(
         }
     };
 
-    let result = super::json_patch::patch_loro_document(doc, patch);
+    // tracing::info!("Applying patch {:?} to document {}", patch, document_id);
+
+    let result = super::json_patch::patch_loro_document(doc.clone(), patch);
     match result {
         Ok(_) => {
+            let res = doc.export(loro::ExportMode::updates(&prev_vv));
+            match res {
+                Ok(update) => {
+                    let doc_id_clone = document_id.clone();
+                    let nc_clone = nc.clone();
+                    let js_clone = js.clone();
+                    let cloned_update = update.clone();
+                    tokio::spawn(async move {
+                        let res = super::wal::send_log(
+                            doc_id_clone.clone(),
+                            nc_clone,
+                            js_clone,
+                            &cloned_update,
+                        )
+                        .await;
+                        if let Err(e) = res {
+                            tracing::error!(
+                                "Failed to send WAL log for document {}: {}",
+                                doc_id_clone,
+                                e
+                            );
+                        }
+                    });
+                    let doc_id_clone = document_id.clone();
+                    let nc_clone = nc.clone();
+                    tokio::spawn(async move {
+                        let res = nc_clone
+                            .publish(
+                                format!("crdt.{}.update", doc_id_clone.clone()),
+                                bytes::Bytes::from(update),
+                            )
+                            .await;
+                        if let Err(e) = res {
+                            tracing::error!(
+                                "Failed to publish CRDT update for document {}: {}",
+                                doc_id_clone,
+                                e
+                            );
+                        }
+                    });
+                }
+                Err(e) => {
+                    send_error(
+                        &responder,
+                        &nc,
+                        &format!("failed to export document after patch: {}", e),
+                    )
+                    .await;
+                    return;
+                }
+            }
+
             send_ok(
                 &responder,
                 &nc,
@@ -296,6 +360,7 @@ async fn process_get(
     nc: std::sync::Arc<async_nats::Client>,
     server_states: std::sync::Arc<super::initialize::LoroServerStates>,
 ) {
+    tracing::info!("Processing get for document {}", document_id);
     let Some(doc) = ensure_document(&msg, document_id.clone(), &nc, server_states).await else {
         return;
     };
@@ -359,6 +424,7 @@ async fn process_purge(
     wal_stream: std::sync::Arc<async_nats::jetstream::stream::Stream>,
     document_seq_kv: std::sync::Arc<async_nats::jetstream::kv::Store>,
 ) {
+    tracing::info!("Processing purge for document {}", document_id);
     let responder = msg.responder;
 
     tracing::info!("Purging document {}", document_id);
