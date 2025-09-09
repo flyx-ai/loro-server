@@ -3,7 +3,6 @@ package web
 import (
 	"bytes"
 	"context"
-	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
@@ -17,53 +16,45 @@ import (
 	gonanoid "github.com/matoous/go-nanoid/v2"
 	"github.com/nats-io/nats.go"
 	"github.com/nats-io/nats.go/jetstream"
-	"github.com/puzpuzpuz/xsync/v4"
 )
 
 func subscribeCRDT(ctx context.Context, nc *nats.Conn, documentID string, clientID string) (chan []byte, error) {
 	resChan := make(chan []byte, 256)
-	ch := make(chan *nats.Msg, 256)
-	subs, err := nc.ChanSubscribe(fmt.Sprintf("crdt.%s.update", documentID), ch)
+	subs, err := transport.Subscribe(ctx, nc, fmt.Sprintf("crdt.%s.update", documentID), "", func(cr transport.CoreResponse) *transport.CoreResponse {
+		if cr.Header.Get("X-Client-ID") == clientID {
+			return nil
+		}
+		dat := []byte{byte(wsDocumentResponseTypeCRDT)}
+		dat = append(dat, cr.Payload...)
+		resChan <- dat
+		return nil
+	})
 	if err != nil {
 		return nil, fmt.Errorf("failed to subscribe to CRDT updates: %w", err)
 	}
-
-	go func() {
-		<-ctx.Done()
+	context.AfterFunc(ctx, func() {
 		if err := subs.Unsubscribe(); err != nil {
 			slog.Error("Failed to unsubscribe from CRDT updates", "error", err)
 		}
-		close(ch)
-	}()
-
-	go func() {
-		for msg := range ch {
-			if msg.Header.Get("X-Client-ID") == clientID {
-				continue
-			}
-			dat := []byte{byte(wsResponseTypeCRDT)}
-			dat = append(dat, msg.Data...)
-			resChan <- dat
-		}
-	}()
+	})
 
 	return resChan, nil
 }
 
-type wsBinaryRequestType uint8
+type wsDocumentBinaryRequestType uint8
 
 const (
-	wsRequestTypeInvalid wsBinaryRequestType = iota
-	wsRequestTypeCRDT
-	wsRequestTypeSync
+	wsDocumentRequestTypeInvalid wsDocumentBinaryRequestType = iota
+	wsDocumentRequestTypeCRDT
+	wsDocumentRequestTypeSync
 )
 
-type wsBinaryResponseType uint8
+type wsDocumentBinaryResponseType uint8
 
 const (
-	wsResponseTypeInvalid wsBinaryResponseType = iota
-	wsResponseTypeCRDT
-	wsResponseTypeVV
+	wsDocumentResponseTypeInvalid wsDocumentBinaryResponseType = iota
+	wsDocumentResponseTypeCRDT
+	wsDocumentResponseTypeVV
 )
 
 func documentInputBinaryHandler(
@@ -79,8 +70,8 @@ func documentInputBinaryHandler(
 	requestType := data[0]
 	data = data[1:]
 
-	switch wsBinaryRequestType(requestType) {
-	case wsRequestTypeCRDT:
+	switch wsDocumentBinaryRequestType(requestType) {
+	case wsDocumentRequestTypeCRDT:
 		wg := sync.WaitGroup{}
 		wg.Add(2)
 
@@ -121,7 +112,7 @@ func documentInputBinaryHandler(
 		if innerErr != nil {
 			return fmt.Errorf("failed to handle CRDT request: %w", innerErr)
 		}
-	case wsRequestTypeSync:
+	case wsDocumentRequestTypeSync:
 		wg := sync.WaitGroup{}
 		wg.Add(2)
 
@@ -129,7 +120,7 @@ func documentInputBinaryHandler(
 		go func() {
 			defer wg.Done()
 
-			resp, err := transport.MakeRequest(ctx, nc, "loro.doc.sync_down."+documentID, data, 60*time.Second)
+			resp, err := transport.MakeRequest(ctx, nc, "loro.doc.sync_down."+documentID, data, nil, 60*time.Second)
 			if err != nil {
 				innerErr = fmt.Errorf("failed to sync down: %w", err)
 				return
@@ -142,13 +133,13 @@ func documentInputBinaryHandler(
 			if len(resp.Payload) == 0 {
 				return
 			}
-			binaryChan <- append([]byte{byte(wsResponseTypeCRDT)}, resp.Payload...)
+			binaryChan <- append([]byte{byte(wsDocumentResponseTypeCRDT)}, resp.Payload...)
 		}()
 
 		go func() {
 			defer wg.Done()
 
-			resp, err := transport.MakeRequest(ctx, nc, "loro.doc.version_vector."+documentID, nil, 60*time.Second)
+			resp, err := transport.MakeRequest(ctx, nc, "loro.doc.version_vector."+documentID, nil, nil, 60*time.Second)
 			if err != nil {
 				innerErr = fmt.Errorf("failed to get version vector: %w", err)
 				return
@@ -157,14 +148,14 @@ func documentInputBinaryHandler(
 				innerErr = fmt.Errorf("version vector request failed with status code: %d", resp.StatusCode)
 				return
 			}
-			binaryChan <- append([]byte{byte(wsResponseTypeVV)}, resp.Payload...)
+			binaryChan <- append([]byte{byte(wsDocumentResponseTypeVV)}, resp.Payload...)
 		}()
 
 		wg.Wait()
 		if innerErr != nil {
 			return fmt.Errorf("failed to handle sync request: %w", innerErr)
 		}
-	case wsRequestTypeInvalid:
+	case wsDocumentRequestTypeInvalid:
 		fallthrough
 	default:
 		return fmt.Errorf("invalid request type: %d", data[0])
@@ -173,64 +164,8 @@ func documentInputBinaryHandler(
 	return nil
 }
 
-type wsTextRequestType uint64
-
-const (
-	wsTextRequestTypeInvalid wsTextRequestType = iota
-)
-
-// //nolint:tagliatelle
-// type wsRequestAwareness struct {
-// 	Awareness any `json:"a"`
-// }
-
-func documentInputTextHandler(
-	ctx context.Context,
-	data []byte,
-	documentID string,
-	clientID string,
-	awarenessState *xsync.Map[string, any],
-	binaryChan chan []byte,
-) error {
-	var req []any
-	if err := json.Unmarshal(data, &req); err != nil {
-		return fmt.Errorf("failed to unmarshal request: %w", err)
-	}
-	if len(req) != 2 {
-		return fmt.Errorf("invalid request length: expected 2, got %d", len(req))
-	}
-	reqTypeFloat, ok := req[0].(float64)
-	if !ok {
-		return fmt.Errorf("invalid request type: expected float64, got %T", req[0])
-	}
-	reqType := wsTextRequestType(reqTypeFloat)
-
-	switch reqType {
-	// var reqAwareness wsRequestAwareness
-	// if err := json.Unmarshal(data, &reqAwareness); err != nil {
-	// 	return ctx.Fail(err)
-	// }
-	//
-	// typ := awarenessTypeUpdate
-	//
-	// _, loaded := awarenessState.LoadAndStore(clientID, reqAwareness.Awareness)
-	// if !loaded {
-	// 	typ = awarenessTypeAdd
-	// }
-	//
-	// err := publishAwareness(ctx, tableID, clientID, reqAwareness.Awareness, typ)
-	// if err != nil {
-	// 	return ctx.Fail(err)
-	// }
-	case wsTextRequestTypeInvalid:
-		fallthrough
-	default:
-		return fmt.Errorf("invalid request type: %d", reqType)
-	}
-}
-
 //nolint:gocyclo
-func TableListenHandler(
+func DocumentListenHandler(
 	ctx context.Context,
 	nc *nats.Conn,
 	js jetstream.JetStream,
@@ -241,7 +176,6 @@ func TableListenHandler(
 ) error {
 	ctx, cancel := context.WithCancelCause(ctx)
 	clientID := gonanoid.Must()
-	awarenessState := xsync.NewMap[string, any]()
 	defer cancel(errors.New("cancel websocket closed"))
 
 	//nolint:exhaustruct
@@ -266,47 +200,7 @@ func TableListenHandler(
 		return fmt.Errorf("failed to subscribe to CRDT: %w", err)
 	}
 
-	// initAwarenessDone := make(chan struct{})
-	// err = subscribeInitAwareness(ctx, documentID, awarenessState, initAwarenessDone)
-	// if err != nil {
-	// 	return fmt.Errorf("failed to subscribe to init awareness: %w", err)
-	// }
-	//
-	// textChan, err := subscribeAwareness(ctx, documentID, clientID, awarenessState)
-	// if err != nil {
-	// 	return ctx.Fail(err)
-	// }
-
 	errCh := make(chan error, 1)
-
-	// go func() {
-	// 	defer close(initAwarenessDone)
-	//
-	// 	resp, err := getInitAwareness(ctx, infoRow.ID)
-	// 	if err != nil {
-	// 		if errors.Is(err, context.DeadlineExceeded) {
-	// 			return
-	// 		}
-	// 		errCh <- ctx.Fail(err)
-	// 		return
-	// 	}
-	//
-	// 	for key, value := range resp.States {
-	// 		awarenessState.Store(key, value)
-	// 	}
-	//
-	// 	msgJSON, err := json.Marshal(resp)
-	// 	if err != nil {
-	// 		errCh <- ctx.Fail(err)
-	// 		return
-	// 	}
-	//
-	// 	err = conn.Write(ctx, websocket.MessageText, msgJSON)
-	// 	if err != nil {
-	// 		errCh <- ctx.Fail(err)
-	// 		return
-	// 	}
-	// }()
 
 	go func() {
 		defer cancel(errors.New("cancel websocket read closed"))
@@ -326,18 +220,14 @@ func TableListenHandler(
 						return
 					}
 				case websocket.MessageText:
-					err := documentInputTextHandler(ctx, data, documentID, clientID, awarenessState, binaryChan)
-					if err != nil {
-						errCh <- fmt.Errorf("failed to handle text message: %w", err)
-						return
-					}
+					errCh <- fmt.Errorf("text messages are not supported, received: %s", string(data))
 				}
 			}()
 		}
 	}()
 
 	go func() {
-		resp, err := transport.MakeRequest(ctx, nc, "loro.doc.version_vector."+documentID, nil, 60*time.Second)
+		resp, err := transport.MakeRequest(ctx, nc, "loro.doc.version_vector."+documentID, nil, nil, 60*time.Second)
 		if err != nil {
 			slog.Error("Failed to get version vector", "error", err)
 			return
@@ -346,18 +236,8 @@ func TableListenHandler(
 			slog.Error("Version vector request failed", "status_code", resp.StatusCode)
 			return
 		}
-		binaryChan <- append([]byte{byte(wsResponseTypeVV)}, resp.Payload...)
+		binaryChan <- append([]byte{byte(wsDocumentResponseTypeVV)}, resp.Payload...)
 	}()
-
-	// go func() {
-	// 	<-ctx.Done()
-	// 	err := publishAwareness(ctx, infoRow.ID, clientID, nil, awarenessTypeRemove)
-	// 	if err != nil {
-	// 		_ = ctx.Fail(err)
-	// 		_ = ctx.Capture(err)
-	// 		return
-	// 	}
-	// }()
 
 	for {
 		select {
@@ -366,16 +246,6 @@ func TableListenHandler(
 			if err != nil {
 				return fmt.Errorf("failed to write binary response: %w", err)
 			}
-		// case res := <-textChan:
-		// 	msgJSON, err := json.Marshal(res)
-		// 	if err != nil {
-		// 		return ctx.Fail(err)
-		// 	}
-		//
-		// 	err = conn.Write(ctx, websocket.MessageText, msgJSON)
-		// 	if err != nil {
-		// 		return ctx.Fail(err)
-		// 	}
 		case <-ctx.Done():
 			if tempErr := ctx.Err(); tempErr != nil {
 				return fmt.Errorf("context done: %w", tempErr)

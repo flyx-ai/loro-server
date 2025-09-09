@@ -80,6 +80,7 @@ func PingAndInitDoc(
 			documentStatus := string(documentEntry.Value())
 			splitStatus := strings.Split(documentStatus, ":")
 			documentStatus = splitStatus[0]
+			done := false
 			switch documentStatus {
 			case "UP":
 				timestampStr := splitStatus[2]
@@ -89,7 +90,7 @@ func PingAndInitDoc(
 				}
 				now := time.Now()
 				if now.Sub(timestamp) <= 5*time.Second {
-					resp, err := MakeRequest(ctx, nc, "loro.doc.ping."+documentID, []byte("ping"), 5*time.Second)
+					resp, err := MakeRequest(ctx, nc, "loro.doc.ping."+documentID, []byte("ping"), nil, 5*time.Second)
 					if err == nil {
 						if string(resp.Payload) == "pong" {
 							return nil
@@ -103,12 +104,15 @@ func PingAndInitDoc(
 			case "DOWN":
 			case "STARTING":
 				if !slices.Contains(oldOperationIDs, splitStatus[1]) {
-					break
+					done = true
 				}
 			case "ERROR":
 				return fmt.Errorf("document %s is in ERROR state: %s", documentID, documentStatus)
 			default:
 				return fmt.Errorf("unknown document status: %s", documentStatus)
+			}
+			if done {
+				break
 			}
 			_, err = documentStatusKV.Update(
 				ctx,
@@ -144,6 +148,7 @@ func PingAndInitDoc(
 			ctx, cancel := context.WithTimeout(ctx, 6*time.Second)
 			defer cancel()
 
+			done := false
 			select {
 			case update := <-updates:
 				if update == nil {
@@ -158,7 +163,7 @@ func PingAndInitDoc(
 				documentStatus := splitStatus[0]
 				switch documentStatus {
 				case "UP":
-					resp, err := MakeRequest(ctx, nc, "loro.doc.ping."+documentID, []byte("ping"), 5*time.Second)
+					resp, err := MakeRequest(ctx, nc, "loro.doc.ping."+documentID, []byte("ping"), nil, 5*time.Second)
 					if err == nil {
 						if string(resp.Payload) == "pong" {
 							return nil
@@ -179,6 +184,9 @@ func PingAndInitDoc(
 				}
 			case <-ctx.Done():
 				slog.Warn("Timeout waiting for document status update", "document_id", documentID)
+				done = true
+			}
+			if done {
 				break
 			}
 		}

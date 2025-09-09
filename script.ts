@@ -1,6 +1,6 @@
-import { createDocument, CRDTDoc } from "./lorojs/loro-client.ts";
+import { CRDTAwareness } from "./lorojs/loro-client.ts";
 
-createDocument("http://localhost:8080", "babysheet");
+// createDocument("http://localhost:8080", "babysheet");
 
 // async function test() {
 //   let id = Math.floor(Math.random() * 1000000).toString();
@@ -48,3 +48,25 @@ createDocument("http://localhost:8080", "babysheet");
 //   .catch((err) => {
 //     console.error("Error during tests:", err);
 //   });
+
+async function hello() {
+  const awareness1 = new CRDTAwareness("awareness", "http://localhost:8080");
+  awareness1.store.set("username", "hello");
+  console.log(awareness1.store.get("username"));
+  await new Promise<void>((resolve) => {
+    setTimeout(() => {
+      resolve();
+    }, 100);
+  });
+  const awareness2 = new CRDTAwareness("awareness", "http://localhost:8080");
+  await new Promise<void>((resolve) => {
+    setTimeout(() => {
+      resolve();
+    }, 100);
+  });
+  console.log(awareness2.store.get("username"));
+  awareness1.destroy();
+  awareness2.destroy();
+}
+
+hello();

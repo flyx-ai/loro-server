@@ -1,4 +1,4 @@
-import { LoroDoc, VersionVector } from "loro-crdt";
+import { EphemeralStore, LoroDoc, VersionVector } from "loro-crdt";
 import { IndexedDBPersistence } from "./indexeddb";
 
 const WS_BIN_REQUEST_TYPE_CRDT = 1;
@@ -136,36 +136,8 @@ export class CRDTDoc {
           console.error("Unknown binary message type", data[0]);
         }
       }
-    } else if (typeof event.data === "string") {
-      const msg = JSON.parse(event.data);
-      switch (msg.t) {
-        // case "initawareness": {
-        //   const newMsg = msg as {
-        //     a: string[];
-        //     r: string[];
-        //     s: Record<string, Record<string, Record<string, unknown>>>;
-        //   };
-        //   for (const key of Object.keys(newMsg.s))
-        //     awareness[key] = newMsg.s[key];
-        //   for (const key of newMsg.r) delete awareness[key];
-        //   for (const key of Object.keys(awareness))
-        //     if (!newMsg.s[key]) delete awareness[key];
-        //   break;
-        // }
-        // case "awareness": {
-        //   const newMsg = msg as {
-        //     a: string[];
-        //     r: string[];
-        //     s: Record<string, Record<string, Record<string, unknown>>>;
-        //   };
-        //   for (const key of Object.keys(newMsg.s))
-        //     awareness[key] = newMsg.s[key];
-        //   for (const key of newMsg.r) delete awareness[key];
-        //   break;
-        // }
-        default:
-          console.error("Unknown string message type " + msg.t);
-      }
+    } else {
+      console.error("Unknown message format: text");
     }
   }
 
@@ -203,6 +175,115 @@ export class CRDTDoc {
     clearInterval(this.intervalID);
     this.indexedDBProvider.destroy();
     this.socket?.close();
+  }
+}
+
+const WS_AWARENESS_BIN_REQUEST_TYPE_UPDATE = 1;
+const WS_AWARENESS_BIN_REQUEST_TYPE_SYNC = 2;
+
+const WS_AWARENESS_BIN_RESPONSE_TYPE_UPDATE = 1;
+const WS_AWARENESS_BIN_RESPONSE_TYPE_SYNC = 2;
+
+export class CRDTAwareness {
+  store: EphemeralStore;
+  socket: WebSocket | null = null;
+  socketOpen = false;
+  onInit?: () => void;
+  hasInit = false;
+  isDestroyed = false;
+  awarenessID: string;
+  endpoint: string;
+
+  constructor(
+    awarenessID: string,
+    endpoint: string,
+    onInit?: () => void,
+    offline?: boolean,
+  ) {
+    this.store = new EphemeralStore();
+    this.onInit = onInit;
+    this.awarenessID = awarenessID;
+    this.endpoint = endpoint;
+
+    this.store.subscribeLocalUpdates((update) => {
+      this.sendBinarySocketMessage(
+        WS_AWARENESS_BIN_REQUEST_TYPE_UPDATE,
+        update,
+      );
+    });
+
+    if (!offline) {
+      const initSocket = () => {
+        this.socket = new WebSocket(
+          endpoint + "/api/v1/awareness/" + awarenessID + "/ws",
+        );
+        this.socket.binaryType = "arraybuffer";
+        this.socket.onmessage = this.socketMsgHandler.bind(this);
+        this.socket.onclose = () => {
+          if (this.isDestroyed) return;
+          this.socketOpen = false;
+          console.warn("Socket closed, attempting to reconnect in 1s...");
+          setTimeout(initSocket, 1000);
+        };
+        this.socket.onerror = (err: unknown) => {
+          console.error("Socket error:", err);
+          this.socket?.close();
+        };
+        this.socket.onopen = () => {
+          this.socketOpen = true;
+        };
+      };
+      initSocket.bind(this)();
+    }
+  }
+
+  sendBinarySocketMessage(messageType: number, data: Uint8Array): boolean {
+    if (!this.socket || this.socket.readyState !== WebSocket.OPEN) return false;
+    const newData = new Uint8Array(data.length + 1);
+    newData[0] = messageType;
+    newData.set(data, 1);
+    this.socket.send(newData);
+    return true;
+  }
+
+  sendTextSocketMessage(messageType: number, data: unknown): boolean {
+    if (!this.socket || this.socket.readyState !== WebSocket.OPEN) return false;
+    this.socket.send(JSON.stringify([messageType, data]));
+    return true;
+  }
+
+  socketMsgHandler(event: MessageEvent) {
+    if (event.data instanceof ArrayBuffer) {
+      const rawData = new Uint8Array(event.data);
+      const messageType = rawData[0];
+      const data = rawData.slice(1);
+      switch (messageType) {
+        case WS_AWARENESS_BIN_RESPONSE_TYPE_UPDATE: {
+          this.store.apply(data);
+          break;
+        }
+        case WS_AWARENESS_BIN_RESPONSE_TYPE_SYNC: {
+          const update = this.store.encodeAll();
+          this.sendBinarySocketMessage(
+            WS_AWARENESS_BIN_REQUEST_TYPE_SYNC,
+            update,
+          );
+          break;
+        }
+        default: {
+          console.error("Unknown binary message type", data[0]);
+        }
+      }
+    } else {
+      console.error("Unknown message format: text");
+    }
+  }
+
+  destroy() {
+    this.isDestroyed = true;
+    console.log("destroying awareness...");
+    this.socket?.close();
+    this.store.destroy();
   }
 }
 

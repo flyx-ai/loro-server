@@ -18,7 +18,7 @@ type failedResponse struct {
 func Purge(ctx context.Context, nc *nats.Conn, documentID string) error {
 	slog.Info("purging document", "documentID", documentID)
 
-	resp, err := MakeRequest(ctx, nc, "loro.doc.purge."+documentID, nil, time.Second*60)
+	resp, err := MakeRequest(ctx, nc, "loro.doc.purge."+documentID, nil, nil, time.Second*60)
 	if err != nil {
 		return fmt.Errorf("failed to purge document %s: %w", documentID, err)
 	}
@@ -48,7 +48,7 @@ func Patch(ctx context.Context, nc *nats.Conn, documentID string, patch []JSONPa
 		return fmt.Errorf("failed to marshal patch: %w", err)
 	}
 
-	resp, err := MakeRequest(ctx, nc, "loro.doc.patch."+documentID, patchBytes, time.Second*30)
+	resp, err := MakeRequest(ctx, nc, "loro.doc.patch."+documentID, patchBytes, nil, time.Second*30)
 	if err != nil {
 		return fmt.Errorf("failed to patch document %s: %w", documentID, err)
 	}
@@ -73,7 +73,7 @@ func Get(ctx context.Context, nc *nats.Conn, documentID string, paths []string) 
 		return nil, fmt.Errorf("failed to marshal paths: %w", err)
 	}
 
-	resp, err := MakeRequest(ctx, nc, "loro.doc.get."+documentID, pathBytes, time.Second*30)
+	resp, err := MakeRequest(ctx, nc, "loro.doc.get."+documentID, pathBytes, nil, time.Second*30)
 	if err != nil {
 		return nil, fmt.Errorf("failed to get document %s: %w", documentID, err)
 	}

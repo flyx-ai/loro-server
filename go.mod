@@ -7,7 +7,6 @@ require (
 	github.com/coder/websocket v1.8.14
 	github.com/matoous/go-nanoid/v2 v2.1.0
 	github.com/nats-io/nats.go v1.45.0
-	github.com/puzpuzpuz/xsync/v4 v4.1.0
 )
 
 require (

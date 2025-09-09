@@ -161,6 +161,7 @@ func processJSONUpdateMessage(
 }
 
 func SubscribeJSONUpdate(ctx context.Context, js jetstream.JetStream, jsonUpdateStream jetstream.Stream) (chan JSONUpdate, error) {
+	// TODO: use batch transport for json update
 	consumer, err := jsonUpdateStream.CreateOrUpdateConsumer(ctx, jetstream.ConsumerConfig{
 		Name:          "json_update_consumer",
 		Durable:       "json_update_consumer",

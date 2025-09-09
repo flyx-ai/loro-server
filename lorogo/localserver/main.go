@@ -5,6 +5,7 @@ import (
 	"log/slog"
 	"net/http"
 	"os"
+	"time"
 
 	"github.com/flyx-ai/loro-server/lorogo/transport"
 	"github.com/flyx-ai/loro-server/lorogo/web"
@@ -28,6 +29,14 @@ func main() {
 	documentStatusKV, err := js.CreateOrUpdateKeyValue(context.Background(), jetstream.KeyValueConfig{
 		Bucket:      "loro-document-status",
 		Description: "Loro Document Status",
+	})
+	if err != nil {
+		panic(err)
+	}
+	awarenessStatusKV, err := js.CreateOrUpdateKeyValue(context.Background(), jetstream.KeyValueConfig{
+		Bucket:      "loro-awareness-status",
+		Description: "Loro Awareness Status",
+		TTL:         time.Minute * 5,
 	})
 	if err != nil {
 		panic(err)
@@ -59,9 +68,22 @@ func main() {
 			return
 		}
 
-		err := web.TableListenHandler(r.Context(), nc, js, documentStatusKV, documentID, w, r)
+		err := web.DocumentListenHandler(r.Context(), nc, js, documentStatusKV, documentID, w, r)
 		if err != nil {
 			slog.Error("Failed to handle WebSocket connection", "documentID", documentID, "error", err)
+			return
+		}
+	})
+	mux.HandleFunc("/api/v1/awareness/{awarenessID}/ws", func(w http.ResponseWriter, r *http.Request) {
+		awarenessID := r.PathValue("awarenessID")
+		if awarenessID == "" {
+			http.Error(w, "awarenessID is required", http.StatusBadRequest)
+			return
+		}
+
+		err := web.AwarenessListenHandler(r.Context(), nc, awarenessStatusKV, awarenessID, w, r)
+		if err != nil {
+			slog.Error("Failed to handle WebSocket connection", "awarenessID", awarenessID, "error", err)
 			return
 		}
 	})
