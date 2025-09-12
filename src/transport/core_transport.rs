@@ -407,6 +407,56 @@ pub enum MakeRequestError {
     NoResponders,
 }
 
+pub async fn send_message(
+    nc: &std::sync::Arc<async_nats::Client>,
+    subject: String,
+    message_id: String,
+    content: &[u8],
+    response_inbox: Option<String>,
+) -> Result<(), MakeRequestError> {
+    let mut current_size = 0;
+    let content_size = content.len();
+    let mut joins: Vec<tokio::task::JoinHandle<Result<(), async_nats::PublishError>>> = Vec::new();
+    for (idx, chunk) in content.chunks(CHUNK_SIZE).enumerate() {
+        current_size += chunk.len();
+        let mut headers = async_nats::HeaderMap::new();
+        headers.insert("X-Message-ID", message_id.clone());
+        headers.insert("X-Chunk-Index", idx.to_string());
+        if current_size == content_size {
+            let mut hasher = twox_hash::XxHash64::with_seed(0);
+            hasher.write(content);
+            let digest = hasher.finish();
+            headers.insert("X-Message-Digest", digest.to_string());
+        }
+        let nc = nc.clone();
+        let response_inbox = response_inbox.clone();
+        let chunk = bytes::Bytes::copy_from_slice(chunk);
+        let subject = subject.clone();
+        joins.push(tokio::spawn(async move {
+            if let Some(response_inbox) = response_inbox {
+                nc.publish_with_reply_and_headers(subject, response_inbox, headers, chunk)
+                    .await
+            } else {
+                nc.publish_with_headers(subject, headers, chunk).await
+            }
+        }));
+    }
+    let join_res = futures_util::future::join_all(joins).await;
+    for res in join_res {
+        match res {
+            Ok(Ok(_)) => {}
+            Ok(Err(e)) => {
+                return Err(MakeRequestError::PublishError(e));
+            }
+            Err(e) => {
+                return Err(MakeRequestError::JoinError(e));
+            }
+        }
+    }
+
+    Ok(())
+}
+
 pub struct CoreResponse {
     pub status_code: u32,
     pub payload: Vec<u8>,
@@ -525,41 +575,7 @@ pub async fn make_request(
             }
         });
 
-    let mut current_size = 0;
-    let content_size = content.len();
-    let mut joins: Vec<tokio::task::JoinHandle<Result<(), async_nats::PublishError>>> = Vec::new();
-    for (idx, chunk) in content.chunks(CHUNK_SIZE).enumerate() {
-        current_size += chunk.len();
-        let mut headers = async_nats::HeaderMap::new();
-        headers.insert("X-Message-ID", message_id.clone());
-        headers.insert("X-Chunk-Index", idx.to_string());
-        if current_size == content_size {
-            let mut hasher = twox_hash::XxHash64::with_seed(0);
-            hasher.write(content);
-            let digest = hasher.finish();
-            headers.insert("X-Message-Digest", digest.to_string());
-        }
-        let nc = nc.clone();
-        let response_inbox = response_inbox.clone();
-        let chunk = bytes::Bytes::copy_from_slice(chunk);
-        let subject = subject.clone();
-        joins.push(tokio::spawn(async move {
-            nc.publish_with_reply_and_headers(subject, response_inbox, headers, chunk)
-                .await
-        }));
-    }
-    let join_res = futures_util::future::join_all(joins).await;
-    for res in join_res {
-        match res {
-            Ok(Ok(_)) => {}
-            Ok(Err(e)) => {
-                return Err(MakeRequestError::PublishError(e));
-            }
-            Err(e) => {
-                return Err(MakeRequestError::JoinError(e));
-            }
-        }
-    }
+    send_message(nc, subject, message_id, content, Some(response_inbox)).await?;
 
     let timeout_result = tokio::time::timeout(timeout, response_listener).await;
     let (resp, code) = timeout_result

@@ -315,12 +315,13 @@ async fn process_patch(
                     let doc_id_clone = document_id.clone();
                     let nc_clone = nc.clone();
                     tokio::spawn(async move {
-                        let res = nc_clone
-                            .publish(
-                                format!("crdt.{}.update", doc_id_clone.clone()),
-                                bytes::Bytes::from(update),
-                            )
-                            .await;
+                        let res = super::core_transport::send_message(
+                            &nc_clone,
+                            format!("crdt.{}.update", doc_id_clone.clone()),
+                            nanoid::nanoid!(),
+                            update.as_slice(),
+                            None,
+                        ).await;
                         if let Err(e) = res {
                             tracing::error!(
                                 "Failed to publish CRDT update for document {}: {}",
