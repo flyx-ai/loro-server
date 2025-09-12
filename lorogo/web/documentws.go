@@ -97,13 +97,16 @@ func documentInputBinaryHandler(
 			defer wg.Done()
 
 			// TODO: batch this
-			err := nc.PublishMsg(&nats.Msg{
-				Subject: fmt.Sprintf("crdt.%s.update", documentID),
-				Data:    data,
-				Header:  nats.Header{"X-Client-ID": []string{clientID}},
-			})
+			err := transport.SendMessage(
+				nc,
+				gonanoid.Must(),
+				fmt.Sprintf("crdt.%s.update", documentID),
+				data,
+				"",
+				nats.Header{"X-Client-ID": []string{clientID}},
+			)
 			if err != nil {
-				innerErr = fmt.Errorf("failed to publish CRDT: %w", err)
+				innerErr = fmt.Errorf("failed to send CRDT message: %w", err)
 				return
 			}
 		}()

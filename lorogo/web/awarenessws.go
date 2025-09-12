@@ -75,11 +75,14 @@ func awarenessInputBinaryHandler(
 
 	switch wsAwarenessBinaryRequestType(requestType) {
 	case wsAwarenessRequestTypeUpdate:
-		err := nc.PublishMsg(&nats.Msg{
-			Subject: fmt.Sprintf("awareness.%s.update", awarenessID),
-			Data:    data,
-			Header:  nats.Header{"X-Client-ID": []string{clientID}},
-		})
+		err := transport.SendMessage(
+			nc,
+			gonanoid.Must(),
+			fmt.Sprintf("awareness.%s.update", awarenessID),
+			data,
+			"",
+			nats.Header{"X-Client-ID": []string{clientID}},
+		)
 		if err != nil {
 			return fmt.Errorf("failed to publish awareness update: %w", err)
 		}

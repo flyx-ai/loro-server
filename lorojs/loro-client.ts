@@ -63,7 +63,7 @@ export class CRDTDoc {
     if (!offline) {
       const initSocket = () => {
         this.socket = new WebSocket(
-          endpoint + "/api/v1/document/" + documentID + "/ws",
+          endpoint + "/document/" + documentID + "/ws",
         );
         this.socket.binaryType = "arraybuffer";
         this.socket.onmessage = this.socketMsgHandler.bind(this);
@@ -161,12 +161,9 @@ export class CRDTDoc {
 
   // VERY DANGEROUS, REMOVES ALL DATA, USE WITH CAUTION
   async purge() {
-    await fetch(
-      this.endpoint + "/api/v1/document/" + this.documentID + "/purge",
-      {
-        method: "POST",
-      },
-    );
+    await fetch(this.endpoint + "/document/" + this.documentID + "/purge", {
+      method: "POST",
+    });
   }
 
   destroy() {
@@ -215,7 +212,7 @@ export class CRDTAwareness {
     if (!offline) {
       const initSocket = () => {
         this.socket = new WebSocket(
-          endpoint + "/api/v1/awareness/" + awarenessID + "/ws",
+          endpoint + "/awareness/" + awarenessID + "/ws",
         );
         this.socket.binaryType = "arraybuffer";
         this.socket.onmessage = this.socketMsgHandler.bind(this);
@@ -288,5 +285,5 @@ export class CRDTAwareness {
 }
 
 export async function createDocument(endpoint: string, documentID: string) {
-  await fetch(endpoint + "/api/v1/document/" + documentID, { method: "POST" });
+  await fetch(endpoint + "/document/" + documentID, { method: "POST" });
 }
