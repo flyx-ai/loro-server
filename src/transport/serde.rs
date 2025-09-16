@@ -228,7 +228,7 @@ fn serde_to_loro_int(
                                     }
                                     loro::ValueOrContainer::Container(c) => {
                                         container
-                                            .insert(k, loro::LoroValue::Container(c.id()))
+                                            .insert_container(k, c)
                                             .map_err(SerdeToLoroError::WriteError)?;
                                     }
                                 }
@@ -246,24 +246,22 @@ fn serde_to_loro_int(
                             let values: Result<Vec<_>, _> =
                                 arr.into_iter().map(|x| serde_to_loro(x.clone())).collect();
                             let values = values?;
-                            let values: Vec<loro::LoroValue> = values
-                                .iter()
-                                .map(|x| match x {
-                                    loro::ValueOrContainer::Value(v) => (*v).clone(),
-                                    loro::ValueOrContainer::Container(c) => {
-                                        loro::LoroValue::Container(c.id())
-                                    }
-                                })
-                                .collect();
                             let container = if let (Some(r), Some(id)) = (root, root_container) {
                                 r.get_list(id)
                             } else {
                                 loro::LoroList::new()
                             };
                             for value in values {
-                                container
-                                    .push(value)
-                                    .map_err(SerdeToLoroError::WriteError)?;
+                                match value {
+                                    loro::ValueOrContainer::Value(v) => {
+                                        container.push(v).map_err(SerdeToLoroError::WriteError)?;
+                                    }
+                                    loro::ValueOrContainer::Container(c) => {
+                                        container
+                                            .push_container(c)
+                                            .map_err(SerdeToLoroError::WriteError)?;
+                                    }
+                                };
                             }
                             return Ok(loro::ValueOrContainer::Container(loro::Container::List(
                                 container,
@@ -278,24 +276,22 @@ fn serde_to_loro_int(
                             let values: Result<Vec<_>, _> =
                                 arr.into_iter().map(|x| serde_to_loro(x.clone())).collect();
                             let values = values?;
-                            let values: Vec<loro::LoroValue> = values
-                                .iter()
-                                .map(|x| match x {
-                                    loro::ValueOrContainer::Value(v) => (*v).clone(),
-                                    loro::ValueOrContainer::Container(c) => {
-                                        loro::LoroValue::Container(c.id())
-                                    }
-                                })
-                                .collect();
                             let container = if let (Some(r), Some(id)) = (root, root_container) {
                                 r.get_movable_list(id)
                             } else {
                                 loro::LoroMovableList::new()
                             };
                             for value in values {
-                                container
-                                    .push(value)
-                                    .map_err(SerdeToLoroError::WriteError)?;
+                                match value {
+                                    loro::ValueOrContainer::Value(v) => {
+                                        container.push(v).map_err(SerdeToLoroError::WriteError)?;
+                                    }
+                                    loro::ValueOrContainer::Container(c) => {
+                                        container
+                                            .push_container(c)
+                                            .map_err(SerdeToLoroError::WriteError)?;
+                                    }
+                                };
                             }
                             return Ok(loro::ValueOrContainer::Container(
                                 loro::Container::MovableList(container),
