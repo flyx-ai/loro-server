@@ -35,6 +35,7 @@ pub async fn init_document_endpoints(
     let mut patch_subscriber = subscribe_endpoint(&nc, "patch", &document_id).await?;
     let mut get_subscriber = subscribe_endpoint(&nc, "get", &document_id).await?;
     let mut purge_subscriber = subscribe_endpoint(&nc, "purge", &document_id).await?;
+    let mut fork_subscriber = subscribe_endpoint(&nc, "fork", &document_id).await?;
 
     loop {
         if !server_states.exists(document_id.clone()).await {
@@ -48,6 +49,7 @@ pub async fn init_document_endpoints(
             Some(msg) = patch_subscriber.next() => (msg, Endpoint::Patch),
             Some(msg) = get_subscriber.next() => (msg, Endpoint::Get),
             Some(msg) = purge_subscriber.next() => (msg, Endpoint::Purge),
+            Some(msg) = fork_subscriber.next() => (msg, Endpoint::Fork),
         };
 
         let new_document_id = document_id.clone();
@@ -79,6 +81,7 @@ enum Endpoint {
     Patch,
     Get,
     Purge,
+    Fork,
 }
 
 async fn process_message(
@@ -110,6 +113,7 @@ async fn process_message(
             )
             .await
         }
+        Endpoint::Fork => process_fork(msg, document_id, nc, js, server_states).await,
     }
 }
 
@@ -321,7 +325,8 @@ async fn process_patch(
                             nanoid::nanoid!(),
                             update.as_slice(),
                             None,
-                        ).await;
+                        )
+                        .await;
                         if let Err(e) = res {
                             tracing::error!(
                                 "Failed to publish CRDT update for document {}: {}",
@@ -455,4 +460,52 @@ async fn process_purge(
     tracing::info!("Purged WAL for document {}", document_id);
 
     send_ok_string(&responder, &nc, "{{\"status\": \"ok\"}}").await;
+}
+
+async fn process_fork(
+    msg: super::core_transport::CoreMessage,
+    document_id: String,
+    nc: std::sync::Arc<async_nats::Client>,
+    js: std::sync::Arc<async_nats::jetstream::Context>,
+    server_states: std::sync::Arc<super::initialize::LoroServerStates>,
+) {
+    tracing::info!("Processing fork for document {}", document_id);
+    let Some(doc) = ensure_document(&msg, document_id.clone(), &nc, server_states).await else {
+        return;
+    };
+    let responder = msg.responder;
+
+    let new_document_id = String::from_utf8_lossy(msg.payload.as_slice());
+
+    if new_document_id.len() == 0 {
+        send_error(&responder, &nc, "new document ID cannot be empty").await;
+        return;
+    }
+
+    let new_doc = doc.fork();
+    let snapshot = new_doc.export(loro::ExportMode::all_updates());
+
+    match snapshot {
+        Ok(snapshot) => {
+            let res =
+                super::wal::send_log(new_document_id.to_string(), nc.clone(), js, &snapshot).await;
+            if let Err(e) = res {
+                tracing::error!(
+                    "Failed to send WAL log for document {}: {}",
+                    new_document_id.to_string(),
+                    e
+                );
+            }
+
+            send_ok(
+                &responder,
+                &nc,
+                format!("{{\"status\": \"ok\"}}").as_bytes(),
+            )
+            .await;
+        }
+        Err(e) => {
+            send_error(&responder, &nc, &format!("failed to fork: {}", e)).await;
+        }
+    }
 }

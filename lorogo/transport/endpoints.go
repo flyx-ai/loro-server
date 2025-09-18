@@ -9,6 +9,7 @@ import (
 	"time"
 
 	"github.com/nats-io/nats.go"
+	"github.com/nats-io/nats.go/jetstream"
 )
 
 type failedResponse struct {
@@ -92,4 +93,26 @@ func Get(ctx context.Context, nc *nats.Conn, documentID string, paths []string) 
 	}
 
 	return result, nil
+}
+
+func Fork(ctx context.Context, nc *nats.Conn, documentID string, newDocumentID string, documentStatusKV jetstream.KeyValue) error {
+	err := PingAndInitDoc(ctx, newDocumentID, nc, documentStatusKV)
+	if err != nil {
+		return fmt.Errorf("failed to ping and init new document %s: %w", newDocumentID, err)
+	}
+
+	resp, err := MakeRequest(ctx, nc, "loro.doc.fork."+documentID, []byte(newDocumentID), nil, time.Second*60)
+	if err != nil {
+		return fmt.Errorf("failed to fork document %s to %s: %w", documentID, newDocumentID, err)
+	}
+
+	if resp.StatusCode != 200 {
+		var failure failedResponse
+		if err := json.Unmarshal(resp.Payload, &failure); err != nil {
+			return fmt.Errorf("failed to unmarshal failed response: %w", err)
+		}
+		return fmt.Errorf("fork failed with code %d: %s", resp.StatusCode, failure.Message)
+	}
+
+	return nil
 }
